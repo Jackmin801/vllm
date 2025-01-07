@@ -6,22 +6,39 @@ import torch
 
 MODEL_NAME = "meta-llama/Llama-3.1-70B-Instruct"
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-llm = LLM(model=MODEL_NAME, tensor_parallel_size=4, max_model_len=4096)
+llm = LLM(model=MODEL_NAME, tensor_parallel_size=4, max_model_len=4096, enforce_eager=True)
 model_runner = llm.llm_engine.model_executor.driver_worker.model_runner
 model = llm.llm_engine.model_executor.driver_worker.model_runner.model
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
+print(model)
 print(model_runner)
 print(dir(model_runner))
 #from vllm.config import VllmConfig, set_current_vllm_config
 #vllm_config = VllmConfig()
 
 prefill_tensors = []
+def prefill_hook(module, args, output):
+    prefill_tensors.append(output)
+
+bar_tensors = []
+
 def foo(module, args, output):
     print("Hello!!")
-    prefill_tensors.append(output[0].detach().clone())
 
-handle = model.model.register_forward_hook(foo)
+def bar(module, args):
+    #bar_tensors.append(output)
+    bar_tensors.append(args[0])
+    print("World!!")
+
+def meow_func(module, args, output):
+    print(module)
+
+#handle = model.model.register_forward_hook(foo)
+#bar_handle = model.register_forward_hook(bar)
+bar_handle = model.model.norm.register_forward_pre_hook(bar)
+meow_handle = model.model.embed_tokens.register_forward_hook(meow_func)
+meow1_handle = model.model.layers[-1].register_forward_hook(prefill_hook)
 
 def get_attn_metadata(seq_len: int):
     return FlashAttentionMetadata(
@@ -82,15 +99,21 @@ def get_prefill_and_decode_tensors(input_text: str) -> tuple[list[torch.Tensor],
     print([[*tokenizer(input_text).input_ids, *output.outputs[0].token_ids]])
     token_ids = torch.tensor([[*tokenizer(input_text).input_ids, *output.outputs[0].token_ids]], device='cuda:0')
     print(token_ids.shape, token_ids)
+    print("Prefill:", [i for i in prefill_tensors])
+    print("Bar:", [i for i in bar_tensors])
+    print(f"Prefill lens {len(prefill_tensors)}:", [len(i) for i in prefill_tensors])
+    print("Prefill shape:", [i[0].shape for i in prefill_tensors])
+    print("Prefill shape:", [i[1].shape for i in prefill_tensors])
 
     kv_caches = [torch.zeros(0) for _ in range(80)]
     positions = torch.arange(0, token_ids.shape[1], device=token_ids.device, dtype=torch.long)
     attn_metadata = get_attn_metadata(token_ids.shape[1])
     with set_forward_context(attn_metadata, model_runner.vllm_config):
-        with torch.inference_mode():
-            _ = model(token_ids, positions, kv_caches, attn_metadata)
+        _ = model(token_ids, positions, kv_caches, attn_metadata)
     
-    print("Prefill:", [i.shape for i in prefill_tensors])
+    print("Prefill:", [i for i in prefill_tensors])
+    print("Prefill shape:", [i[0].shape for i in prefill_tensors])
+    print("Prefill shape:", [i[1].shape for i in prefill_tensors])
 
 prompts = [
     "What is the capital of France?",
