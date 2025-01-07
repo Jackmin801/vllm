@@ -1648,13 +1648,16 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
+        from torch.distributed import get_rank
         if prefill_meta is None and decode_meta.use_cuda_graph:
             assert model_input.input_tokens is not None
             graph_batch_size = model_input.input_tokens.shape[0]
             model_executable = self.graph_runners[virtual_engine][
                 graph_batch_size]
+            print(f"Cuda graph {get_rank()}")
         else:
             model_executable = self.model
+            print(f"No graph {get_rank()}")
 
         # Receive KV cache in distributed KV cache transfer setting
         # In disagg prefill setting, it will also recv hidden states and bypass
@@ -1734,6 +1737,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     torch.tensor(model_forward_time + orig_model_forward_time))
             return hidden_or_intermediate_states
 
+        if get_rank() == 0 and hidden_or_intermediate_states.shape[0] > 1:
+            print("Meow:", hidden_or_intermediate_states.shape, hidden_or_intermediate_states.view(-1)[:10], model_input.input_tokens, [i.shape for i in kv_caches], model_input.input_positions, model_input.attn_metadata)
         logits = self.model.compute_logits(hidden_or_intermediate_states,
                                            model_input.sampling_metadata)
 
