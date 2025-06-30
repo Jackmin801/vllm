@@ -79,8 +79,7 @@ class TopKTopPSampler(nn.Module):
         The logits tensor may be updated in-place.
         """
         logits = apply_top_k_top_p(logits, k, p)
-        probs = logits.softmax(dim=-1, dtype=torch.float32)
-        return random_sample(probs, generators)
+        return random_sample_toploc(logits, generators)
 
     def forward_cuda(
         self,
@@ -253,6 +252,43 @@ def random_sample(
             q[i].exponential_(generator=generator)
     return probs.div_(q).argmax(dim=-1).view(-1)
 
+GUMBEL_BATCH_SIZE = 2 ** 16
+def generate_neg_gumbel_noise(n: int | tuple[int, int], generator: torch.Generator, device: torch.device):
+    if isinstance(n, int):
+        ret = torch.empty(n, device=device)
+        for i in range(0, n, GUMBEL_BATCH_SIZE):
+            end = min(i + GUMBEL_BATCH_SIZE, n)
+            ret[i:end].exponential_(generator=generator).log_()
+    else:
+        ret = torch.empty(n[0], n[1], device=device)
+        for i in range(0, n[0]):
+            for j in range(0, n[1], GUMBEL_BATCH_SIZE):
+                end_j = min(j + GUMBEL_BATCH_SIZE, n[1])
+                ret[i, j:end_j].exponential_(generator=generator).log_()
+    return ret
+
+def random_sample_toploc(
+    logits: torch.Tensor,
+    generators: dict[int, torch.Generator],
+) -> torch.Tensor:
+    """Randomly sample from the probabilities.
+
+    We use this function instead of torch.multinomial because torch.multinomial
+    causes CPU-GPU synchronization.
+    """
+    # TODO: Whats the int about? Do we ever have empty?
+    if len(generators) > 0:
+        _generators = [generators[i] for i in range(len(generators))]
+        neg_gumbel_noise = torch.stack([
+            generate_neg_gumbel_noise(logits.shape[-1], generator, logits.device) for generator in _generators
+        ])
+    else:
+        neg_gumbel_noise = torch.empty_like(logits)
+        neg_gumbel_noise.exponential_().log_()
+    _race_result = logits - neg_gumbel_noise
+    token_ids = torch.argmax(_race_result, dim=-1)
+    #chosen_noises.append(torch.gather(neg_gumbel_noise, 1, token_ids.unsqueeze(1)))
+    return token_ids.view(-1)
 
 def flashinfer_sample(
     logits: torch.Tensor,
