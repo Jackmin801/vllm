@@ -1,4 +1,5 @@
-from tqdm import tqdm
+import asyncio
+from tqdm.asyncio import tqdm
 import torch
 import openai
 import argparse
@@ -6,6 +7,7 @@ from datasets import load_dataset
 from pathlib import Path
 import random
 from transformers import AutoTokenizer
+from typing import List, Dict
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run activation saving and inference generation with a language model.")
@@ -21,7 +23,60 @@ def parse_args():
     
     return parser.parse_args()
 
-def main(args):
+async def process_single_prompt(
+    client: openai.AsyncOpenAI,
+    prompt: str,
+    model_name: str,
+    system_prompt: str,
+    max_decode_tokens: int,
+    temperature: float,
+    tokenizer: AutoTokenizer,
+    debug: bool = False
+) -> Dict:
+    """Process a single prompt asynchronously."""
+    seed = random.randint(0, int(1e12))
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt}
+    ]
+    
+    response = await client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        logprobs=True,
+        max_tokens=max_decode_tokens,
+        seed=seed,
+        temperature=temperature,
+    )
+    
+    # outputs = response.choices[0].message.content
+    output_token_ids = [int(i.token[len("token_id:"):]) for i in response.choices[0].logprobs.content]
+    
+    if debug:
+        print(output_token_ids)
+        print(response.choices[0].message.tool_calls)
+    
+    input_ids = [int(i) for i in response.choices[0].message.tool_calls[0].function.arguments.split(",")]
+
+    result = {
+        "input_ids": input_ids,
+        "output_ids": output_token_ids,
+        "seed": seed,
+        "logits": None,
+        "noise_at_output_ids": None,
+        "toploc1_proof": None,
+    }
+    
+    if debug:
+        print(result)
+        print(tokenizer.decode(input_ids))
+        print(len(input_ids), len(output_token_ids))
+        print("-" * 100)
+        print(tokenizer.decode(output_token_ids))
+    
+    return result
+
+async def main(args):
     ds = load_dataset(args.dataset_name, split="train")
     print(ds)
     if "ultrachat" in args.dataset_name:
@@ -34,51 +89,33 @@ def main(args):
     save_dir.mkdir(parents=True, exist_ok=True)
     results_save_path = save_dir / f"results_{args.model_name.replace('/', '--')}.pt"
 
-    client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="Bearer sk-proj-1234567890")
+    client = openai.AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="Bearer sk-proj-1234567890")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    results: list[dict] = []
-    # Process prompts in batches
-    for prompt in tqdm(prompts):
-        seed = random.randint(0, int(1e12))
-        messages = [
-            {"role": "system", "content": args.system_prompt},
-            {"role": "user", "content": prompt}
-        ]
-        response = client.chat.completions.create(
-            model=args.model_name,
-            messages=messages,
-            logprobs=True,
-            max_tokens=args.max_decode_tokens,
-            seed=seed,
+    # Create async tasks for all prompts
+    tasks = []
+    for prompt in prompts:
+        task = process_single_prompt(
+            client=client,
+            prompt=prompt,
+            model_name=args.model_name,
+            system_prompt=args.system_prompt,
+            max_decode_tokens=args.max_decode_tokens,
             temperature=args.temperature,
+            tokenizer=tokenizer,
+            debug=args.debug
         )
-        # outputs = response.choices[0].message.content
-        output_token_ids = [int(i.token[len("token_id:"):]) for i in response.choices[0].logprobs.content]
-        print(output_token_ids)
-        print(response.choices[0].message.tool_calls)
-        input_ids = [int(i) for i in response.choices[0].message.tool_calls[0].function.arguments.split(",")]
-
-        result = {
-            "input_ids": input_ids,
-            "output_ids": output_token_ids,
-            "seed": seed,
-            "logits": None,
-            "noise_at_output_ids": None,
-            "toploc1_proof": None,
-        }
+        tasks.append(task)
+    
+    # Run all tasks concurrently with progress bar
+    results: List[Dict] = []
+    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing prompts"):
+        result = await coro
         results.append(result)
-
-        if args.debug:
-            print(result)
-            print(tokenizer.decode(input_ids))
-            print(len(input_ids), len(output_token_ids))
-            print("-" * 100)
-            print(tokenizer.decode(output_token_ids))
 
     torch.save(results, results_save_path)
     print(f"Saved results to {results_save_path}")
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args)
+    asyncio.run(main(args))
