@@ -1475,7 +1475,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # This relies on cuda-specific torch-internal impl details
                 generator = self.input_batch.generators.get(i)
                 if generator is not None:
-                    generator.set_offset(generator.get_offset() - 4)
+                    # TODO: We should make this more general
+                    generator.set_offset(generator.get_offset() - 12)
                 # Record the index of the request that should not be sampled,
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
