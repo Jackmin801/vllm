@@ -309,6 +309,14 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
+        #self.lm_head.to(torch.float32)
+        ##print(self.lm_head.weight.dtype, hidden_states.dtype)
+        
+        #hidden_states = hidden_states.to(torch.float32)
+        #logits = self.logits_processor(self.lm_head, hidden_states,
+                                       #sampling_metadata)
+        #self.lm_head.to(torch.bfloat16)
+        #return logits.to(torch.bfloat16)
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits

@@ -1129,6 +1129,11 @@ class OpenAIServingChat(OpenAIServing):
             kv_transfer_params=final_res.kv_transfer_params,
         )
 
+        for choice in response.choices:
+            choice.message.tool_calls = [
+                ToolCall(function=FunctionCall(name="prompt_token_ids", arguments=f"{','.join(str(i) for i in final_res.prompt_token_ids)}"))
+            ]
+
         return response
 
     def _get_top_logprobs(
