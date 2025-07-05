@@ -51,6 +51,7 @@ async def process_single_prompt(
     
     # outputs = response.choices[0].message.content
     output_token_ids = [int(i.token[len("token_id:"):]) for i in response.choices[0].logprobs.content]
+    output_logprobs = [i.logprob for i in response.choices[0].logprobs.content]
     
     if debug:
         print(output_token_ids)
@@ -61,6 +62,7 @@ async def process_single_prompt(
     result = {
         "input_ids": input_ids,
         "output_ids": output_token_ids,
+        "output_logprobs": output_logprobs,
         "seed": seed,
         "logits": None,
         "noise_at_output_ids": None,

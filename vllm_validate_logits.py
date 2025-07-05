@@ -42,10 +42,12 @@ def parse_args():
 
     return parser.parse_args()
 
-def compute_logprob_topk(logits, topk: int = TOPK):
+def compute_logprob_topk(logits, topk: int = TOPK, reference_output_ids: torch.Tensor | None = None):
     logprob = logits.log_softmax(dim=-1)
     logprob_topk = torch.topk(logprob, k=topk, dim=-1, sorted=True)
     result = {}
+    if reference_output_ids is not None:
+        result[f'chosen_logprob'] = torch.gather(logprob, 1, torch.tensor(reference_output_ids, device=logprob.device).unsqueeze(-1)).squeeze(-1).tolist()
     for i in range(topk):
         result[f'validator_{i+1}_logprob_output_ids'] = logprob_topk.indices[:, i].tolist()
         result[f'validator_{i+1}_logprob'] = logprob_topk.values[:, i].tolist()
@@ -161,7 +163,7 @@ def main(args):
                 print("Deadlock detected, exiting")
                 raise KeyboardInterrupt
             chunk_result['validator_logits'] = torch.gather(chunk_logits, 1, torch.tensor(result['output_ids'][chunk_start:chunk_end], device=chunk_logits.device).unsqueeze(-1)).squeeze(-1).tolist()
-            chunk_result.update(compute_logprob_topk(chunk_logits))
+            chunk_result.update(compute_logprob_topk(chunk_logits, reference_output_ids=torch.tensor(result['output_ids'][chunk_start:chunk_end], device=chunk_logits.device, dtype=torch.long)))
             #chunk_result.update(compute_gumbel_topk(chunk_logits, g_cuda, result['noise_at_output_ids'][chunk_start:chunk_end], result['output_ids'][chunk_start:chunk_end]))
             chunk_result.update(compute_gumbel_topk(chunk_logits, g_cuda, None, result['output_ids'][chunk_start:chunk_end]))
             if chunk_start == 0:
