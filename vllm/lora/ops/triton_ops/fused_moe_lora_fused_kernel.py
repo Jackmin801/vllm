@@ -333,6 +333,9 @@ def invoke_fused_moe_lora_kernel(
 
     config = config.copy()
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K", 32)
+    # Remove keys that the base MoE config may contain but our kernel doesn't
+    for extra_key in ("SPLIT_K", "num_warps", "num_stages"):
+        config.pop(extra_key, None)
 
     fused_moe_with_lora_kernel[grid](
         A,
