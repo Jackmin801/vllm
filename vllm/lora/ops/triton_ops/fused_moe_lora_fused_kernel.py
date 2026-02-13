@@ -39,38 +39,18 @@ def get_fused_lora_default_config(
 ) -> dict[str, int]:
     """Heuristic tile config for the fused MoE+LoRA kernel.
 
-    Chooses BLOCK_SIZE_M based on expected tokens per (expert, lora) group
-    to keep tile utilization >= 50% and reduce padding inflation at small
-    batch sizes.
+    Uses BM=16 universally (best across all batch sizes on B200 tuning)
+    with NW=8 to compensate for extra register pressure from lora_acc.
+    The launcher applies maxnreg=80 to cap registers at 3 blocks/SM.
     """
-    tokens_per_group = max(1, (M * top_k) // (E * max_loras))
-    if tokens_per_group <= 16:
-        return {
-            "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 1,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
-    elif tokens_per_group <= 64:
-        return {
-            "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
-    else:
-        return {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
+    return {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 16,
+        "num_warps": 8,
+        "num_stages": 2,
+    }
 
 
 @functools.lru_cache
@@ -451,6 +431,12 @@ def invoke_fused_moe_lora_kernel(
     # Remove SPLIT_K which the base MoE config may contain but our kernel
     # doesn't use. Preserve num_warps/num_stages so tuned values reach Triton.
     config.pop("SPLIT_K", None)
+    # Cap register usage to improve occupancy. Default 80 matches the base
+    # kernel's register count at NW=8, achieving 3 blocks/SM on B200.
+    # Without this, the LoRA accumulator pushes to 113 regs → 2 blocks/SM.
+    # Can be overridden via config JSON (e.g. "maxnreg": 96).
+    if "maxnreg" not in config:
+        config["maxnreg"] = 80
 
     fused_moe_with_lora_kernel[grid](
         A,
