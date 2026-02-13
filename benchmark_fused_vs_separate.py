@@ -14,6 +14,7 @@ import triton.language as tl
 
 from vllm.lora.ops.triton_ops.fused_moe_lora_fused_kernel import (
     invoke_fused_moe_lora_kernel,
+    try_get_optimal_fused_lora_config,
 )
 from vllm.lora.ops.triton_ops.moe_lora_align import (
     moe_lora_align_block_size_fused,
@@ -90,19 +91,25 @@ def benchmark_one(
     num_valid_tokens = num_tokens * top_k
     compute_type = tl.bfloat16 if dtype == torch.bfloat16 else tl.float16
 
-    # Get config
+    # Get configs — separate configs for base/separate vs fused paths
     w2_shape = (num_experts, K, N_total)  # dummy for config
-    config = try_get_optimal_moe_config(
+    base_config = try_get_optimal_moe_config(
         w.size(), w2_shape, top_k, "bfloat16", num_tokens
     )
-    block_size_m = config["BLOCK_SIZE_M"]
+    fused_config = try_get_optimal_fused_lora_config(
+        w.size(), w2_shape, top_k, "bfloat16", num_tokens,
+        max_loras=max_loras,
+    )
+    base_block_size_m = base_config["BLOCK_SIZE_M"]
+    fused_block_size_m = fused_config["BLOCK_SIZE_M"]
 
     # =====================================================================
     # Setup for FUSED path
     # =====================================================================
     sorted_token_ids_f, expert_ids_f, lora_ids_f, num_post_f = (
         moe_lora_align_block_size_fused(
-            topk_ids, lora_ids_per_token, block_size_m, num_experts, max_loras
+            topk_ids, lora_ids_per_token, fused_block_size_m,
+            num_experts, max_loras,
         )
     )
     output_fused = torch.zeros(
@@ -113,7 +120,7 @@ def benchmark_one(
     # Setup for SEPARATE path (base GEMM + separate LoRA)
     # =====================================================================
     sorted_token_ids_s, expert_ids_s, num_post_s = moe_align_block_size(
-        topk_ids, block_size_m, num_experts
+        topk_ids, base_block_size_m, num_experts
     )
     output_base = torch.zeros(
         num_tokens, top_k, N_total, device=device, dtype=dtype
@@ -136,7 +143,7 @@ def benchmark_one(
             hidden_states, w, output_fused, topk_weights,
             sorted_token_ids_f, expert_ids_f, lora_ids_f, num_post_f,
             lora_a_fused, lora_b_fused,
-            True, top_k, num_slices, config,
+            True, top_k, num_slices, fused_config,
             compute_type=compute_type,
         )
     torch.cuda.synchronize()
@@ -151,7 +158,7 @@ def benchmark_one(
             None, None,
             topk_weights,
             sorted_token_ids_s, expert_ids_s, num_post_s,
-            True, top_k, config, compute_type=compute_type,
+            True, top_k, base_config, compute_type=compute_type,
             use_fp8_w8a8=False, use_int8_w8a8=False,
             use_int8_w8a16=False, use_int4_w4a16=False,
             per_channel_quant=False,
@@ -167,10 +174,10 @@ def benchmark_one(
             top_k, lora_ids_int, adapter_enabled,
             device=torch.device(device),
             N=rank, M=num_tokens,
-            EM=num_tokens * top_k * block_size_m,
+            EM=num_tokens * top_k * base_block_size_m,
             K=K, num_tokens=num_tokens * top_k,
             num_experts=num_experts, num_slices=num_slices,
-            block_size_m=block_size_m,
+            block_size_m=base_block_size_m,
             block_size_n=min(64, rank),
             block_size_k=32,
             group_size_m=8,
@@ -188,11 +195,11 @@ def benchmark_one(
             top_k, lora_ids_int, adapter_enabled,
             device=torch.device(device),
             N=rank, M=num_tokens,
-            EM=num_tokens * top_k * block_size_m,
+            EM=num_tokens * top_k * base_block_size_m,
             K=K, num_tokens=num_tokens * top_k,
             num_experts=num_experts, num_slices=num_slices,
             max_lora_rank=rank, w1_output_dim_size=N,
-            block_size_m=block_size_m,
+            block_size_m=base_block_size_m,
             block_size_n=min(64, N),
             block_size_k=min(32, rank),
             group_size_m=8,
@@ -213,7 +220,7 @@ def benchmark_one(
             hidden_states, w, output_fused, topk_weights,
             sorted_token_ids_f, expert_ids_f, lora_ids_f, num_post_f,
             lora_a_fused, lora_b_fused,
-            True, top_k, num_slices, config,
+            True, top_k, num_slices, fused_config,
             compute_type=compute_type,
         )
     torch.cuda.synchronize()
@@ -232,7 +239,7 @@ def benchmark_one(
             None, None,
             topk_weights,
             sorted_token_ids_s, expert_ids_s, num_post_s,
-            True, top_k, config, compute_type=compute_type,
+            True, top_k, base_config, compute_type=compute_type,
             use_fp8_w8a8=False, use_int8_w8a8=False,
             use_int8_w8a16=False, use_int4_w4a16=False,
             per_channel_quant=False,
@@ -248,10 +255,10 @@ def benchmark_one(
             top_k, lora_ids_int, adapter_enabled,
             device=torch.device(device),
             N=rank, M=num_tokens,
-            EM=num_tokens * top_k * block_size_m,
+            EM=num_tokens * top_k * base_block_size_m,
             K=K, num_tokens=num_tokens * top_k,
             num_experts=num_experts, num_slices=num_slices,
-            block_size_m=block_size_m,
+            block_size_m=base_block_size_m,
             block_size_n=min(64, rank),
             block_size_k=32,
             group_size_m=8,
@@ -269,11 +276,11 @@ def benchmark_one(
             top_k, lora_ids_int, adapter_enabled,
             device=torch.device(device),
             N=rank, M=num_tokens,
-            EM=num_tokens * top_k * block_size_m,
+            EM=num_tokens * top_k * base_block_size_m,
             K=K, num_tokens=num_tokens * top_k,
             num_experts=num_experts, num_slices=num_slices,
             max_lora_rank=rank, w1_output_dim_size=N,
-            block_size_m=block_size_m,
+            block_size_m=base_block_size_m,
             block_size_n=min(64, N),
             block_size_k=min(32, rank),
             group_size_m=8,
@@ -297,7 +304,7 @@ def benchmark_one(
             None, None,
             topk_weights,
             sorted_token_ids_s, expert_ids_s, num_post_s,
-            True, top_k, config, compute_type=compute_type,
+            True, top_k, base_config, compute_type=compute_type,
             use_fp8_w8a8=False, use_int8_w8a8=False,
             use_int8_w8a16=False, use_int4_w4a16=False,
             per_channel_quant=False,
@@ -333,7 +340,7 @@ def main():
 
     header = (
         f"{'Tokens':>8s} | {'Base (ms)':>10s} | {'Separate (ms)':>14s} | "
-        f"{'Fused (ms)':>11s} | {'Sep OH (ms)':>12s} | {'Fused OH (ms)':>14s} | "
+        f"{'Fused (ms)':>11s} | {'Fused OH%':>10s} | {'Fused BM':>8s} | "
         f"{'Speedup':>7s}"
     )
     print(header)
@@ -360,14 +367,20 @@ def main():
             results.append((num_tokens, None, None, None))
             continue
 
-        sep_overhead = sep_ms - base_ms
-        fused_overhead = fused_ms - base_ms
+        fused_overhead_pct = (fused_ms - base_ms) / base_ms * 100 if base_ms > 0 else 0
         speedup = sep_ms / fused_ms if fused_ms > 0 else float("inf")
+
+        # Show which fused BLOCK_SIZE_M was selected
+        from vllm.lora.ops.triton_ops.fused_moe_lora_fused_kernel import (
+            get_fused_lora_default_config,
+        )
+        fc = get_fused_lora_default_config(num_tokens, num_experts, max_loras, top_k)
+        fused_bm = fc["BLOCK_SIZE_M"]
 
         print(
             f"{num_tokens:>8d} | {base_ms:>9.3f}  | {sep_ms:>13.3f}  | "
-            f"{fused_ms:>10.3f}  | {sep_overhead:>+11.3f}  | {fused_overhead:>+13.3f}  | "
-            f"{speedup:>6.2f}x"
+            f"{fused_ms:>10.3f}  | {fused_overhead_pct:>+9.1f}% | "
+            f"BM={fused_bm:>3d}  | {speedup:>6.2f}x"
         )
         sys.stdout.flush()
 

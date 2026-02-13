@@ -21,11 +21,126 @@ Supports:
 - HAS_LORA constexpr to compile out LoRA paths when no LoRA in batch
 """
 
+import functools
+import json
+import os
 from typing import Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
+
+
+def get_fused_lora_default_config(
+    M: int, E: int, max_loras: int, top_k: int
+) -> dict[str, int]:
+    """Heuristic tile config for the fused MoE+LoRA kernel.
+
+    Chooses BLOCK_SIZE_M based on expected tokens per (expert, lora) group
+    to keep tile utilization >= 50% and reduce padding inflation at small
+    batch sizes.
+    """
+    tokens_per_group = max(1, (M * top_k) // (E * max_loras))
+    if tokens_per_group <= 16:
+        return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    elif tokens_per_group <= 64:
+        return {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    else:
+        return {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+
+
+@functools.lru_cache
+def _get_fused_lora_configs(
+    E: int, N: int, dtype: str | None
+) -> dict[int, Any] | None:
+    """Load tuned fused-LoRA configs from JSON, mirroring get_moe_configs().
+
+    Looks in ``vllm/lora/ops/triton_ops/configs/`` for files named like
+    ``E=8,N=4096,device_name=NVIDIA_H100,...json``.
+    """
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        get_config_file_name,
+    )
+    from vllm.model_executor.layers.batch_invariant import (
+        vllm_is_batch_invariant,
+    )
+
+    if vllm_is_batch_invariant():
+        return None
+
+    json_file_name = get_config_file_name(E, N, dtype)
+
+    config_file_paths = []
+
+    user_folder = os.environ.get("VLLM_TUNED_CONFIG_FOLDER")
+    if user_folder is not None:
+        config_file_paths.append(os.path.join(user_folder, json_file_name))
+
+    default_dir = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "configs"
+    )
+    config_file_paths.append(os.path.join(default_dir, json_file_name))
+
+    for path in config_file_paths:
+        if os.path.exists(path):
+            with open(path) as f:
+                logger.info_once(
+                    "Using configuration from %s for fused MoE+LoRA layer.",
+                    path,
+                    scope="global",
+                )
+                tuned = json.load(f)
+                tuned.pop("triton_version", None)
+                return {int(k): v for k, v in tuned.items()}
+
+    return None
+
+
+def try_get_optimal_fused_lora_config(
+    w1_shape: tuple[int, ...],
+    w2_shape: tuple[int, ...],
+    top_k: int,
+    dtype: str | None,
+    M: int,
+    max_loras: int,
+) -> dict[str, int]:
+    """Get the best available config for the fused MoE+LoRA kernel.
+
+    Tries GPU-specific JSON configs first, falls back to the heuristic.
+    """
+    E, _, N = w2_shape
+    configs = _get_fused_lora_configs(E, N, dtype)
+
+    if configs:
+        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+    else:
+        config = get_fused_lora_default_config(M, E, max_loras, top_k)
+
+    return config
 
 
 @triton.jit
@@ -333,9 +448,9 @@ def invoke_fused_moe_lora_kernel(
 
     config = config.copy()
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K", 32)
-    # Remove keys that the base MoE config may contain but our kernel doesn't
-    for extra_key in ("SPLIT_K", "num_warps", "num_stages"):
-        config.pop(extra_key, None)
+    # Remove SPLIT_K which the base MoE config may contain but our kernel
+    # doesn't use. Preserve num_warps/num_stages so tuned values reach Triton.
+    config.pop("SPLIT_K", None)
 
     fused_moe_with_lora_kernel[grid](
         A,

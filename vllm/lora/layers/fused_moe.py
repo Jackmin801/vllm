@@ -19,6 +19,7 @@ from vllm.distributed.utils import divide
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.lora.ops.triton_ops.fused_moe_lora_fused_kernel import (
     invoke_fused_moe_lora_kernel,
+    try_get_optimal_fused_lora_config,
 )
 from vllm.lora.ops.triton_ops.moe_lora_align import (
     moe_lora_align_block_size_fused,
@@ -37,7 +38,6 @@ from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     TritonExperts,
-    try_get_optimal_moe_config,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
@@ -751,13 +751,14 @@ class TritonExpertsWithLoRA(TritonExperts):
         if global_num_experts == -1:
             global_num_experts = E
 
-        config = try_get_optimal_moe_config(
+        lora_layer = self._lora_layer
+        config = try_get_optimal_fused_lora_config(
             w1.size(),
             w2.size(),
             top_k_num,
             self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
-            block_shape=self.block_shape,
+            max_loras=lora_layer.max_loras,
         )
 
         if hidden_states.dtype == torch.bfloat16:
@@ -784,7 +785,6 @@ class TritonExpertsWithLoRA(TritonExperts):
         )
 
         # --- Get LoRA token mapping from punica_wrapper ---
-        lora_layer = self._lora_layer
         (token_lora_mapping, _, _, _, _, _, _) = (
             lora_layer.punica_wrapper.token_mapping_meta.meta_args(
                 num_tokens,
