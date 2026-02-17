@@ -39,17 +39,28 @@ def get_fused_lora_default_config(
 ) -> dict[str, int]:
     """Heuristic tile config for the fused MoE+LoRA kernel.
 
-    Uses BM=16 universally (best across all batch sizes on B200 tuning)
-    with NW=8 to compensate for extra register pressure from lora_acc.
-    The launcher applies maxnreg=80 to cap registers at 3 blocks/SM.
+    On Blackwell (B200), TMEM holds MMA accumulators off-registers, so high
+    maxnreg (255) avoids spills and is optimal.  BM=128 is best for large
+    batches; BM=16 for small batches where occupancy matters more.
     """
+    if M >= 1024:
+        return {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 8,
+            "num_stages": 3,
+            "maxnreg": 255,
+        }
     return {
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 16,
+        "GROUP_SIZE_M": 1,
         "num_warps": 8,
         "num_stages": 2,
+        "maxnreg": 255,
     }
 
 
@@ -431,12 +442,11 @@ def invoke_fused_moe_lora_kernel(
     # Remove SPLIT_K which the base MoE config may contain but our kernel
     # doesn't use. Preserve num_warps/num_stages so tuned values reach Triton.
     config.pop("SPLIT_K", None)
-    # Cap register usage to improve occupancy. Default 80 matches the base
-    # kernel's register count at NW=8, achieving 3 blocks/SM on B200.
-    # Without this, the LoRA accumulator pushes to 113 regs → 2 blocks/SM.
-    # Can be overridden via config JSON (e.g. "maxnreg": 96).
+    # On Blackwell (sm_100a), TMEM holds MMA accumulators off-registers,
+    # so high maxnreg avoids register spills. Default 255 lets the compiler
+    # use registers freely. Tuned per-batch configs override via JSON.
     if "maxnreg" not in config:
-        config["maxnreg"] = 80
+        config["maxnreg"] = 255
 
     fused_moe_with_lora_kernel[grid](
         A,
