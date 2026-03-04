@@ -189,6 +189,28 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         else:
             assert isinstance(m_fused_moe_fn.fused_experts, TritonExperts)
 
+        # When EP is active, intercept _prepare() output to capture
+        # post-dispatch (M_total) hidden_states, topk_ids, topk_weights.
+        # This avoids a separate AllGather — the dispatch already gathers
+        # these tensors. We only need to AllGather token_lora_mapping.
+        if use_ep:
+            original_prepare = m_fused_moe_fn._prepare
+
+            def prepare_decorator(*args, **kwargs):
+                result = original_prepare(*args, **kwargs)
+                if self._num_active_adapters > 0:
+                    a1q, _, _, topk_ids_d, topk_weights_d = result
+                    # a1q is the dispatched hidden_states (M_total).
+                    # If unquantized, we can use it directly for LoRA.
+                    moe_state_dict["dispatched_a1q"] = a1q
+                    moe_state_dict["dispatched_topk_ids"] = topk_ids_d
+                    moe_state_dict["dispatched_topk_weights"] = (
+                        topk_weights_d
+                    )
+                return result
+
+            m_fused_moe_fn._prepare = prepare_decorator
+
         def fwd_decorator(layer, func):
             def wrapper(*args, **kwargs):
                 moe_state_dict["hidden_states"] = kwargs["hidden_states"]
@@ -199,50 +221,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     "apply_router_weight_on_input"
                 ]
 
-                if use_ep and self.adapter_enabled.sum() > 0:
-                    # AllGather token_lora_mapping from all DP/EP ranks.
-                    # The runner already AllGathered hidden_states and
-                    # router_logits, but token_lora_mapping is LoRA-specific
-                    # and must be gathered separately.
-                    ctx = get_forward_context()
-                    dp_metadata = ctx.dp_metadata
-                    is_sp = (
-                        self.base_layer.moe_config.is_sequence_parallel
+                if use_ep and self._num_active_adapters > 0:
+                    # Pre-allocated lora_ids covering all LoRA slots.
+                    moe_state_dict["ep_lora_ids"] = self._ep_lora_ids
+                    moe_state_dict["ep_num_active_loras"] = (
+                        self._ep_num_active
                     )
-                    sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
-                    dist_group = (
-                        get_ep_group() if is_sp else get_dp_group()
-                    )
-                    M_local = sizes[dist_group.rank_in_group]
-
-                    # Get local token_lora_mapping
-                    (local_tlm, _, _, _, _, _, _) = (
-                        self.punica_wrapper.token_mapping_meta.meta_args(
-                            M_local
-                        )
-                    )
-                    local_tlm = local_tlm[:M_local].to(torch.int32)
-
-                    # AllGather across DP/EP ranks
-                    [gathered_tlm] = dist_group.all_gatherv(
-                        [local_tlm], dim=0, sizes=sizes
-                    )
-                    moe_state_dict["ep_token_lora_mapping"] = gathered_tlm
-
-                    # Recompute lora_ids and num_active_loras from the
-                    # gathered mapping (other ranks may use different LoRAs)
-                    unique_ids = torch.unique(gathered_tlm, sorted=True)
-                    pos_ids = unique_ids[unique_ids >= 0]
-                    ep_lora_ids = torch.full(
-                        (self.max_loras + 1,), -1,
-                        dtype=torch.int32, device=gathered_tlm.device,
-                    )
-                    ep_lora_ids[:pos_ids.size(0)] = pos_ids
-                    ep_num_active = torch.tensor(
-                        [pos_ids.size(0)], dtype=torch.int32, device="cpu",
-                    )
-                    moe_state_dict["ep_lora_ids"] = ep_lora_ids
-                    moe_state_dict["ep_num_active_loras"] = ep_num_active
 
                 result = func(*args, **kwargs)
                 return result
@@ -259,10 +243,84 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 expert_map = moe_state_dict["expert_map"]
 
                 # Skip LoRA when no adapters are loaded (e.g. profile_run)
-                if self.adapter_enabled.sum() == 0:
+                if self._num_active_adapters == 0:
                     result = func(*args, **kwargs)
                     moe_state_dict["intermediate_cache2"] = output
                     return result
+
+                # For EP: use post-dispatch data from prepare_decorator.
+                # The dispatch already AllGathered hidden_states, topk_ids,
+                # topk_weights to M_total. We only need to gather the
+                # token_lora_mapping to cover M_total tokens.
+                ep_lora_ids = moe_state_dict.get("ep_lora_ids")
+                ep_num_active = moe_state_dict.get("ep_num_active_loras")
+                ep_tlm = None
+
+                if use_ep and self._num_active_adapters > 0:
+                    dispatched_a1q = moe_state_dict.get("dispatched_a1q")
+                    if (dispatched_a1q is not None
+                            and dispatched_a1q.dtype
+                            == hidden_states.dtype):
+                        # Use the unquantized dispatched hidden_states
+                        # (already M_total from the EP dispatch).
+                        hidden_states = dispatched_a1q
+                        curr_topk_ids = moe_state_dict[
+                            "dispatched_topk_ids"
+                        ]
+                        topk_weights = moe_state_dict[
+                            "dispatched_topk_weights"
+                        ]
+
+                    # The EP dispatch returns GLOBAL expert IDs (not
+                    # remapped). Apply expert_map to get local IDs:
+                    # local_id for this rank's experts, -1 otherwise.
+                    curr_topk_ids = expert_map[curr_topk_ids]
+
+                    # Replace -1 (non-local experts) with a sentinel
+                    # value (= local_num_experts) that triggers the
+                    # alignment kernel's skip logic (expert_id >=
+                    # num_experts). Use pre-allocated sentinel tensor
+                    # to avoid tensor creation during CUDA graph
+                    # capture.
+                    curr_topk_ids = torch.where(
+                        curr_topk_ids >= 0,
+                        curr_topk_ids,
+                        self._ep_topk_sentinel,
+                    )
+
+                    # expert_map already applied above, so don't pass
+                    # it to the alignment kernel (would double-remap).
+                    expert_map = None
+
+                    # Build token_lora_mapping for M_total tokens.
+                    # We AllGather local mappings from all EP ranks so
+                    # that tokens from other ranks get correct LoRA IDs.
+                    M_total = hidden_states.size(0)
+                    ctx = get_forward_context()
+                    dp_metadata = ctx.dp_metadata
+                    is_sp = (
+                        self.base_layer.moe_config.is_sequence_parallel
+                    )
+                    dist_group = (
+                        get_ep_group() if is_sp else get_dp_group()
+                    )
+                    sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+                    M_local = sizes[dist_group.rank_in_group]
+
+                    specialize = (
+                        self.punica_wrapper.lora_config
+                        .specialize_active_lora
+                    )
+                    (local_tlm_raw, _, _, _, _, _, _) = (
+                        self.punica_wrapper.token_mapping_meta.meta_args(
+                            M_local, specialize
+                        )
+                    )
+                    local_tlm = local_tlm_raw[:M_local].to(torch.int32)
+
+                    ep_tlm = dist_group.all_gatherv(
+                        local_tlm, dim=0, sizes=sizes,
+                    )
 
                 config_dtype = _get_config_dtype_str(
                     dtype=hidden_states.dtype,
@@ -292,11 +350,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     <= self.base_layer.local_num_experts * self.max_loras
                 )
 
-                # For EP: use AllGathered metadata
-                ep_tlm = moe_state_dict.get("ep_token_lora_mapping")
-                ep_lora_ids = moe_state_dict.get("ep_lora_ids")
-                ep_num_active = moe_state_dict.get("ep_num_active_loras")
-
                 (
                     token_lora_mapping,
                     sorted_token_ids_lora,
@@ -321,6 +374,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     num_tokens_post_padded_lora
                 )
                 moe_state_dict["token_lora_mapping"] = token_lora_mapping
+
+                # Store EP hidden_states/topk for moe_sum_decorator
+                if use_ep and self._num_active_adapters > 0:
+                    moe_state_dict["hidden_states"] = hidden_states
+                    moe_state_dict["topk_ids"] = curr_topk_ids
+                    moe_state_dict["topk_weights"] = topk_weights
 
                 if sorted_token_ids_lora is not None:
                     expert_ids_lora = expert_ids_lora.view(self.max_loras, -1)
@@ -361,7 +420,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 topk_weights = moe_state_dict["topk_weights"]
 
                 # Skip LoRA when no adapters are loaded
-                if self.adapter_enabled.sum() == 0:
+                if self._num_active_adapters == 0:
                     return func(*args, **kwargs)
 
                 config_dtype = _get_config_dtype_str(
@@ -528,6 +587,31 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.adapter_enabled = torch.tensor(
             [0] * (max_loras + 1), dtype=torch.int, device=self.device
         )
+        self._num_active_adapters = 0
+
+        # Pre-allocate EP LoRA metadata tensors so the fwd_decorator
+        # doesn't need torch.unique() or CPU tensor creation, which
+        # are not compatible with CUDA graph capture.
+        # Use all possible LoRA IDs; the kernel skips inactive ones
+        # via adapter_enabled.
+        if self.base_layer.use_ep:
+            self._ep_lora_ids = torch.cat([
+                torch.arange(self.max_loras, dtype=torch.int32,
+                             device=self.device),
+                torch.tensor([-1], dtype=torch.int32,
+                             device=self.device),
+            ])
+            self._ep_num_active = torch.tensor(
+                [self.max_loras], dtype=torch.int32, device="cpu",
+            )
+            # Sentinel value for replacing -1 in EP-dispatched topk_ids.
+            # Pre-allocated to avoid tensor creation during CUDA graph
+            # capture.  local_num_experts triggers the kernel's
+            # (expert_id >= num_experts) skip.
+            self._ep_topk_sentinel = torch.tensor(
+                self.base_layer.local_num_experts,
+                dtype=torch.int32, device=self.device,
+            )
 
         self._create_lora_a_weights(max_loras, lora_config)
         self._create_lora_b_weights(max_loras, lora_config)
@@ -638,6 +722,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w2_lora_a_stacked[0][index] = 0
         self.w2_lora_b_stacked[0][index] = 0
         self.adapter_enabled[index] = 0
+        self._num_active_adapters = int(self.adapter_enabled.sum().item())
 
     #
 
@@ -654,6 +739,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         self.reset_lora(index)
         self.adapter_enabled[index] = 1
+        self._num_active_adapters = int(self.adapter_enabled.sum().item())
 
         num_experts = self.w13_lora_a_stacked[0].shape[1]
 
@@ -795,6 +881,22 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
         self.adapter_enabled = torch.tensor(
             [0] * (max_loras + 1), dtype=torch.int, device=self.device
         )
+        self._num_active_adapters = 0
+
+        if self.base_layer.use_ep:
+            self._ep_lora_ids = torch.cat([
+                torch.arange(self.max_loras, dtype=torch.int32,
+                             device=self.device),
+                torch.tensor([-1], dtype=torch.int32,
+                             device=self.device),
+            ])
+            self._ep_num_active = torch.tensor(
+                [self.max_loras], dtype=torch.int32, device="cpu",
+            )
+            self._ep_topk_sentinel = torch.tensor(
+                self.base_layer.local_num_experts,
+                dtype=torch.int32, device=self.device,
+            )
 
         self._create_lora_a_weights(max_loras, lora_config)
         self._create_lora_b_weights(max_loras, lora_config)
@@ -842,6 +944,7 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
 
         self.reset_lora(index)
         self.adapter_enabled[index] = 1
+        self._num_active_adapters = int(self.adapter_enabled.sum().item())
 
         w13_lora_a, w2_lora_a = lora_a
         w13_lora_b, w2_lora_b = lora_b
