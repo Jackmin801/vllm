@@ -9,10 +9,13 @@ from transformers import PretrainedConfig
 from vllm import envs
 from vllm.config.lora import LoRAConfig
 from vllm.distributed.parallel_state import (
+    get_dp_group,
+    get_ep_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.utils import divide
+from vllm.forward_context import get_forward_context
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.lora.ops.triton_ops.utils import get_lora_op_configs
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -127,16 +130,21 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     def _inject_lora_into_fused_moe(self):
         moe_state_dict = {}
         top_k = self.base_layer.top_k
+        use_ep = self.base_layer.use_ep
 
         self.base_layer.ensure_moe_quant_config_init()
         quant_config = self.base_layer.quant_method.moe_quant_config
 
-        if not getattr(self.base_layer.quant_method, "supports_internal_mk",
-                       False):
-            # The quant method hasn't built its modular kernel yet (e.g.
-            # UnquantizedFusedMoEMethod).  Trigger the init so that it
-            # picks an EP-aware prepare/finalize when EP is active.
-            self.base_layer.maybe_init_modular_kernel()
+        # Track whether we need to replace the quant method.
+        # For EP with naive dispatch, the runner handles AllGather/
+        # ReduceScatter externally. It decides whether to do this based on
+        # `supports_internal_mk`. If we call _replace_quant_method with a
+        # FusedMoEModularMethod, supports_internal_mk becomes True and the
+        # runner skips naive dispatch — but our kernel uses NoEP, so no
+        # EP dispatch happens. To avoid this, when EP is active and the
+        # quant method doesn't own an internal MK, we reuse the existing
+        # kernel and skip _replace_quant_method.
+        need_replace_quant_method = True
 
         if getattr(self.base_layer.quant_method, "supports_internal_mk", False):
             # Use the existing modular kernel from the quant method
@@ -144,6 +152,24 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             # Don't let the kernel own shared experts so the runner can
             # overlap them with routed experts via a separate CUDA stream.
             m_fused_moe_fn.shared_experts = None
+        elif use_ep:
+            # EP with naive dispatch: reuse the existing kernel so the
+            # runner continues to handle AllGather/ReduceScatter externally.
+            existing_kernel = getattr(
+                self.base_layer.quant_method, 'kernel', None
+            )
+            if existing_kernel is not None:
+                m_fused_moe_fn = existing_kernel
+                need_replace_quant_method = False
+            else:
+                # Fallback for quant methods without .kernel attribute
+                prepare_finalize = MoEPrepareAndFinalizeNoEP()
+                m_fused_moe_fn = FusedMoEModularKernel(
+                    prepare_finalize,
+                    self.base_layer.quant_method.select_gemm_impl(
+                        prepare_finalize, self.base_layer
+                    ),
+                )
         else:
             # Create a new modular kernel via select_gemm_impl.
             # Don't pass shared_experts to the kernel so the runner can
@@ -172,6 +198,52 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 moe_state_dict["apply_router_weight_on_input"] = kwargs[
                     "apply_router_weight_on_input"
                 ]
+
+                if use_ep and self.adapter_enabled.sum() > 0:
+                    # AllGather token_lora_mapping from all DP/EP ranks.
+                    # The runner already AllGathered hidden_states and
+                    # router_logits, but token_lora_mapping is LoRA-specific
+                    # and must be gathered separately.
+                    ctx = get_forward_context()
+                    dp_metadata = ctx.dp_metadata
+                    is_sp = (
+                        self.base_layer.moe_config.is_sequence_parallel
+                    )
+                    sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+                    dist_group = (
+                        get_ep_group() if is_sp else get_dp_group()
+                    )
+                    M_local = sizes[dist_group.rank_in_group]
+
+                    # Get local token_lora_mapping
+                    (local_tlm, _, _, _, _, _, _) = (
+                        self.punica_wrapper.token_mapping_meta.meta_args(
+                            M_local
+                        )
+                    )
+                    local_tlm = local_tlm[:M_local].to(torch.int32)
+
+                    # AllGather across DP/EP ranks
+                    [gathered_tlm] = dist_group.all_gatherv(
+                        [local_tlm], dim=0, sizes=sizes
+                    )
+                    moe_state_dict["ep_token_lora_mapping"] = gathered_tlm
+
+                    # Recompute lora_ids and num_active_loras from the
+                    # gathered mapping (other ranks may use different LoRAs)
+                    unique_ids = torch.unique(gathered_tlm, sorted=True)
+                    pos_ids = unique_ids[unique_ids >= 0]
+                    ep_lora_ids = torch.full(
+                        (self.max_loras + 1,), -1,
+                        dtype=torch.int32, device=gathered_tlm.device,
+                    )
+                    ep_lora_ids[:pos_ids.size(0)] = pos_ids
+                    ep_num_active = torch.tensor(
+                        [pos_ids.size(0)], dtype=torch.int32, device="cpu",
+                    )
+                    moe_state_dict["ep_lora_ids"] = ep_lora_ids
+                    moe_state_dict["ep_num_active_loras"] = ep_num_active
+
                 result = func(*args, **kwargs)
                 return result
 
@@ -184,8 +256,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 hidden_states = moe_state_dict["hidden_states"]
                 topk_weights = moe_state_dict["topk_weights"]
                 curr_topk_ids = moe_state_dict["topk_ids"]
-
                 expert_map = moe_state_dict["expert_map"]
+
+                # Skip LoRA when no adapters are loaded (e.g. profile_run)
+                if self.adapter_enabled.sum() == 0:
+                    result = func(*args, **kwargs)
+                    moe_state_dict["intermediate_cache2"] = output
+                    return result
 
                 config_dtype = _get_config_dtype_str(
                     dtype=hidden_states.dtype,
@@ -208,8 +285,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     config_dtype=config_dtype,
                 )
 
-                # SPARSITY_FACTOR is a heuristic margin ensuring tokens * top_k
-                # activates only a small fraction of total experts * loras.
                 SPARSITY_FACTOR = 8
                 naive_block_assignment = (
                     expert_map is None
@@ -217,7 +292,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     <= self.base_layer.local_num_experts * self.max_loras
                 )
 
-                # get the block size of m from customized config or default config
+                # For EP: use AllGathered metadata
+                ep_tlm = moe_state_dict.get("ep_token_lora_mapping")
+                ep_lora_ids = moe_state_dict.get("ep_lora_ids")
+                ep_num_active = moe_state_dict.get("ep_num_active_loras")
+
                 (
                     token_lora_mapping,
                     sorted_token_ids_lora,
@@ -227,11 +306,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     curr_topk_ids,
                     num_tokens,
                     shrink_config["BLOCK_SIZE_M"],
-                    self.base_layer.global_num_experts,
+                    self.base_layer.local_num_experts,
                     self.max_loras,
                     self.adapter_enabled,
                     expert_map,
                     naive_block_assignment=naive_block_assignment,
+                    token_lora_mapping=ep_tlm,
+                    lora_ids=ep_lora_ids,
                 )
 
                 moe_state_dict["sorted_token_ids_lora"] = sorted_token_ids_lora
@@ -246,7 +327,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     sorted_token_ids_lora = sorted_token_ids_lora.view(
                         self.max_loras, -1
                     )
-                #
 
                 self.punica_wrapper.add_lora_fused_moe(
                     input.view(-1, top_k, input.shape[-1]),
@@ -259,11 +339,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     num_tokens_post_padded_lora,
                     max_lora_rank,
                     top_k,
-                    shrink_config,  ## pass the shrink config
-                    expand_config,  ## pass the expand config
+                    shrink_config,
+                    expand_config,
                     self.adapter_enabled,
                     fully_sharded=self.fully_sharded,
                     token_lora_mapping=token_lora_mapping,
+                    lora_ids=ep_lora_ids,
+                    num_active_loras=ep_num_active,
                 )
 
                 result = func(*args, **kwargs)
@@ -277,6 +359,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             def wrapper(*args, **kwargs):
                 hidden_states = moe_state_dict["hidden_states"]
                 topk_weights = moe_state_dict["topk_weights"]
+
+                # Skip LoRA when no adapters are loaded
+                if self.adapter_enabled.sum() == 0:
+                    return func(*args, **kwargs)
 
                 config_dtype = _get_config_dtype_str(
                     dtype=hidden_states.dtype,
@@ -306,6 +392,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 ]
                 token_lora_mapping = moe_state_dict.get("token_lora_mapping")
 
+                # For EP: use AllGathered metadata
+                ep_lora_ids = moe_state_dict.get("ep_lora_ids")
+                ep_num_active = moe_state_dict.get("ep_num_active_loras")
+
                 if sorted_token_ids_lora is not None:
                     expert_ids_lora = expert_ids_lora.view(self.max_loras, -1)
                     sorted_token_ids_lora = sorted_token_ids_lora.view(
@@ -314,7 +404,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 intermediate_cache2 = moe_state_dict["intermediate_cache2"]
                 intermediate_cache3 = args[0]
 
-                shard_size_w2 = divide(self.base_layer.hidden_size, self.tp_size)
+                shard_size_w2 = divide(
+                    self.base_layer.hidden_size, self.tp_size
+                )
 
                 self.punica_wrapper.add_lora_fused_moe(
                     intermediate_cache3,
@@ -327,13 +419,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     num_tokens_post_padded_lora,
                     max_lora_rank,
                     top_k,
-                    shrink_config,  ## pass the shrink config
-                    expand_config,  ## pass the expand config
+                    shrink_config,
+                    expand_config,
                     self.adapter_enabled,
                     True,
                     fully_sharded=self.fully_sharded,
-                    offset=shard_size_w2 * self.tp_rank if self.fully_sharded else 0,
+                    offset=(
+                        shard_size_w2 * self.tp_rank
+                        if self.fully_sharded else 0
+                    ),
                     token_lora_mapping=token_lora_mapping,
+                    lora_ids=ep_lora_ids,
+                    num_active_loras=ep_num_active,
                 )
 
                 result = func(*args, **kwargs)
@@ -350,10 +447,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         fused_experts.moe_sum = moe_sum_decorator(
             self.base_layer, fused_experts.moe_sum
         )
-        # TODO(bnell): find a less intrusive way to handle this.
-        self.base_layer._replace_quant_method(
-            FusedMoEModularMethod(self.base_layer.quant_method, m_fused_moe_fn)
-        )
+        if need_replace_quant_method:
+            # TODO(bnell): find a less intrusive way to handle this.
+            self.base_layer._replace_quant_method(
+                FusedMoEModularMethod(self.base_layer.quant_method, m_fused_moe_fn)
+            )
 
     def _create_lora_a_weights(
         self,
