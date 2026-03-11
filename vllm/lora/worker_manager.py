@@ -192,7 +192,7 @@ class WorkerLoRAManager:
         for adapter_id in requested_ids - existing_adapters:
             self.add_adapter(models_map[adapter_id])
 
-    def add_adapter(self, adapter_request: Any) -> bool:
+    def add_adapter(self, adapter_request: LoRARequest) -> bool:
         if adapter_request.adapter_id in self.list_adapters():
             return False
         loaded_adapter = self._load_adapter(adapter_request)
@@ -219,6 +219,7 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
 
     _manager_cls: type[LRUCacheLoRAModelManager] = LRUCacheLoRAModelManager
 
+    # TODO: I think this method is useless because the base class does the exact same thing
     def create_lora_manager(
         self,
         model: torch.nn.Module,
