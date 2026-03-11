@@ -235,7 +235,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     sorted_token_ids_lora = sorted_token_ids_lora.view(
                         self.max_loras, -1
                     )
-                #
 
                 self.punica_wrapper.add_lora_fused_moe(
                     input.view(-1, top_k, input.shape[-1]),
@@ -581,6 +580,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         ].copy_(sliced_w2_lora_b, non_blocking=True)
 
     def forward(self, *args, **kwargs):
+        if self._num_active_adapters > 0:
+            self.base_layer._lora_ids = self.punica_wrapper.token_lora_indices
+        else:
+            self.base_layer._lora_ids = None
         return self.base_layer.forward(*args, **kwargs)
 
     def maybe_all_reduce_tensor_model_parallel(self, *args, **kwargs):
