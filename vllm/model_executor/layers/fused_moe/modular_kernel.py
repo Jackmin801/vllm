@@ -761,7 +761,6 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
         workspace2: torch.Tensor,
         expert_tokens_meta: ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
-        lora_ids: torch.Tensor | None = None,
     ) -> None:
         """
         This function computes the intermediate result of a Mixture of Experts
@@ -797,8 +796,6 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
         - apply_router_weight_on_input: True if router weights are already
           applied on the input. This is relevant if the implementation
           chooses to do weight application.
-        - lora_ids: Optional per-token LoRA adapter index, shape
-          (num_tokens,). None when no LoRA adapters are active.
         """
         raise NotImplementedError
 
@@ -1168,7 +1165,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
-        lora_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1244,7 +1240,6 @@ class FusedMoEModularKernel(torch.nn.Module):
                 workspace2=workspace2,
                 expert_tokens_meta=c_expert_tokens_meta,
                 apply_router_weight_on_input=apply_router_weight_on_input,
-                lora_ids=lora_ids,
             )
 
         return fused_out
