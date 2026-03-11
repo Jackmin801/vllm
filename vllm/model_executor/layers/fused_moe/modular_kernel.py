@@ -1343,7 +1343,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         expert_map: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         shared_experts_input: torch.Tensor | None = None,
-        lora_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1369,8 +1368,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         - shared_experts_input (Optional[torch.Tensor]): Optional separate
           input for shared experts. For latent MoE, this is the original
           hidden_states before latent projection.
-        - lora_ids (Optional[torch.Tensor]): Optional per-token LoRA adapter
-          index, shape (num_tokens,). None when no LoRA adapters are active.
 
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
@@ -1394,7 +1391,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             global_num_experts,
             expert_map,
             apply_router_weight_on_input,
-            lora_ids=lora_ids,
+            lora_ids=self.punica_wrapper.token_lora_indices,
         )
 
         fused_out = self._fused_experts(
@@ -1411,7 +1408,6 @@ class FusedMoEModularKernel(torch.nn.Module):
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
-            lora_ids=lora_ids,
         )
 
         return self._finalize(

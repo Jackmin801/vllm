@@ -48,7 +48,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # For non-gated MoE (is_act_and_mul=False), only 1 slice is needed
         # since there's only up_proj (w1), not gate_proj + up_proj (w1 + w3)
         self._w13_slices = 2 if base_layer.moe_config.is_act_and_mul else 1
-        self._inject_lora_into_fused_moe()
+        # self._inject_lora_into_fused_moe()
+    
+    def set_mapping(self, punica_wrapper):
+        self.punica_wrapper = punica_wrapper
+        moe_mk = self.base_layer.quant_method.moe_mk
+        if moe_mk is not None:
+            moe_mk.punica_wrapper = punica_wrapper
+        else:
+            raise ValueError("MoE LoRA requires a modular kernel.")
 
     def _normalize_keys(self, config: dict[str, int | None]) -> dict[str, int | None]:
         normalized_config = {}
@@ -580,10 +588,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         ].copy_(sliced_w2_lora_b, non_blocking=True)
 
     def forward(self, *args, **kwargs):
-        if self._num_active_adapters > 0:
-            self.base_layer._lora_ids = self.punica_wrapper.token_lora_indices
-        else:
-            self.base_layer._lora_ids = None
         return self.base_layer.forward(*args, **kwargs)
 
     def maybe_all_reduce_tensor_model_parallel(self, *args, **kwargs):

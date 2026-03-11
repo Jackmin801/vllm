@@ -102,5 +102,4 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             expert_map=None if self.disable_expert_map else layer.expert_map,
             shared_experts_input=shared_experts_input,
-            lora_ids=getattr(layer, "_lora_ids", None),
         )
