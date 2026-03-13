@@ -669,31 +669,62 @@ class LoRAModelManager:
             assert gate_up_proj_lora is not None
             assert down_proj_lora is not None
             if self._is_3d_moe_model:
-                num_experts = module.w13_lora_a_stacked[0].shape[1]
+                local_num_experts = module.w13_lora_a_stacked[0].shape[1]
+                expert_map = module.base_layer._expert_map
 
-                # (num_experts,rank,input_size)
+                # Infer num_experts from the tensor itself.
+                # Checkpoint weights have global_num_experts; dummy weights
+                # (from create_dummy_lora) already have local_num_experts.
+                rank = down_proj_lora.rank
+                num_experts = down_proj_lora.lora_a.shape[0] // rank
+
+                # (num_experts, rank, input_size)
                 gate_up_proj_lora.lora_a = gate_up_proj_lora.lora_a.reshape(
-                    num_experts, -1, gate_up_proj_lora.lora_a.shape[-1]
+                    num_experts, -1,
+                    gate_up_proj_lora.lora_a.shape[-1]
                 )
                 down_proj_lora.lora_a = down_proj_lora.lora_a.reshape(
-                    num_experts, -1, down_proj_lora.lora_a.shape[-1]
+                    num_experts, -1,
+                    down_proj_lora.lora_a.shape[-1]
                 )
 
-                # (output_size,rank,num_experts)
+                # (output_size, rank, num_experts)
                 gate_up_proj_lora.lora_b = gate_up_proj_lora.lora_b.reshape(
-                    gate_up_proj_lora.lora_b.shape[0], -1, num_experts
+                    gate_up_proj_lora.lora_b.shape[0], -1,
+                    num_experts
                 )
                 down_proj_lora.lora_b = down_proj_lora.lora_b.reshape(
-                    down_proj_lora.lora_b.shape[0], -1, num_experts
+                    down_proj_lora.lora_b.shape[0], -1,
+                    num_experts
                 )
 
-                # (num_experts,output_size,rank)
+                # (num_experts, output_size, rank)
                 gate_up_proj_lora.lora_b = gate_up_proj_lora.lora_b.permute(
                     2, 0, 1
                 ).contiguous()
                 down_proj_lora.lora_b = down_proj_lora.lora_b.permute(
                     2, 0, 1
                 ).contiguous()
+
+                # Filter to local experts when EP is active and tensor
+                # has global experts (not the case for dummy weights).
+                if (expert_map is not None
+                        and num_experts > local_num_experts):
+                    local_mask = expert_map != -1
+                    local_indices = local_mask.nonzero(as_tuple=True)[0]
+                    # expert_map[i] gives local index for global expert i
+                    local_order = expert_map[local_indices].long()
+                    # Sort by local index so position i has local_id=i
+                    sort_idx = local_order.argsort()
+
+                    gate_up_proj_lora.lora_a = \
+                        gate_up_proj_lora.lora_a[local_indices][sort_idx]
+                    down_proj_lora.lora_a = \
+                        down_proj_lora.lora_a[local_indices][sort_idx]
+                    gate_up_proj_lora.lora_b = \
+                        gate_up_proj_lora.lora_b[local_indices][sort_idx]
+                    down_proj_lora.lora_b = \
+                        down_proj_lora.lora_b[local_indices][sort_idx]
 
                 module_lora.lora_a = [
                     gate_up_proj_lora.lora_a,
