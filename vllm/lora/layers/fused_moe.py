@@ -52,7 +52,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     
     def set_mapping(self, punica_wrapper):
         self.punica_wrapper = punica_wrapper
-        moe_mk = self.base_layer.quant_method.moe_mk
+        # TODO: We might want to make sure it's modular
+        # And throw error if monolithic
+        moe_mk = self.base_layer.quant_method.moe_kernel.impl
         if moe_mk is not None:
             moe_mk.punica_wrapper = punica_wrapper
         else:
