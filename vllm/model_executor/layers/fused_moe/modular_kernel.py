@@ -1219,6 +1219,8 @@ class FusedMoEModularKernel(torch.nn.Module):
                 local_num_experts,
                 expert_map,
             )
+            if expert_tokens_meta is not None and expert_tokens_meta.lora_ids is not None:
+                c_expert_tokens_meta.lora_ids = expert_tokens_meta.lora_ids[s:e]
 
             c_fused_out = self._slice_output_tensor(
                 fused_out, chunk_idx, num_chunks, CHUNK_SIZE, M_full
@@ -1378,6 +1380,11 @@ class FusedMoEModularKernel(torch.nn.Module):
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
+        
+        if hasattr(self, "punica_wrapper"):
+            lora_ids = self.punica_wrapper.token_lora_indices
+        else:
+            lora_ids = None
 
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             hidden_states,
@@ -1386,7 +1393,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             global_num_experts,
             expert_map,
             apply_router_weight_on_input,
-            lora_ids=self.punica_wrapper.token_lora_indices,
+            lora_ids=lora_ids,
         )
 
         fused_out = self._fused_experts(
