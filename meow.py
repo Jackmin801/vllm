@@ -41,7 +41,8 @@ activation = "silu" # vLLM flashinfer subs silu with SwiGLU?
 tune_max_num_tokens = NUM_TOKENS # This is just to inform the kernel what shapes to tune for
 
 # Lora specific
-lora_ids = torch.randint(0, MAX_LORAS, (NUM_TOKENS,), dtype=torch.int32)
+# -1 means base model only, no LoRA
+lora_ids = torch.randint(-1, MAX_LORAS, (NUM_TOKENS,), dtype=torch.int32)
 w1_lora_a = torch.randn(MAX_LORAS, LOCAL_EXPERTS, 2, LORA_RANK, HIDDEN_SIZE, dtype=torch.bfloat16) / math.sqrt(HIDDEN_SIZE)
 w1_lora_b = torch.randn(MAX_LORAS, LOCAL_EXPERTS, 2, MOE_INTERMEDIATE_SIZE, LORA_RANK, dtype=torch.bfloat16) / math.sqrt(LORA_RANK)
 w2_lora_a = torch.randn(MAX_LORAS, LOCAL_EXPERTS, LORA_RANK, MOE_INTERMEDIATE_SIZE, dtype=torch.bfloat16) / math.sqrt(MOE_INTERMEDIATE_SIZE)
