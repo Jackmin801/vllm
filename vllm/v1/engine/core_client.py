@@ -52,6 +52,7 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
@@ -543,6 +544,11 @@ class MPClient(EngineCoreClient):
         try:
             # State used for data parallel.
             self.engines_running = False
+            parallel_config = vllm_config.parallel_config
+            # Elastic EP can remove a rank and later add it back with the same
+            # identity. The client input ROUTER needs handover to allow the new
+            # engine to replace the dead connection.
+            enable_input_socket_handover = parallel_config.enable_elastic_ep
 
             self.stats_update_address: str | None = None
             if client_addresses:
@@ -551,7 +557,11 @@ class MPClient(EngineCoreClient):
                 output_address = client_addresses["output_address"]
                 self.stats_update_address = client_addresses.get("stats_update_address")
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
-                    self.ctx, input_address, zmq.ROUTER, bind=True
+                    self.ctx,
+                    input_address,
+                    zmq.ROUTER,
+                    bind=True,
+                    router_handover=enable_input_socket_handover,
                 )
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx, output_address, zmq.PULL
@@ -560,7 +570,11 @@ class MPClient(EngineCoreClient):
                 # Engines are managed by this client.
                 addresses = get_engine_zmq_addresses(vllm_config)
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
-                    self.ctx, addresses.inputs[0], zmq.ROUTER, bind=True
+                    self.ctx,
+                    addresses.inputs[0],
+                    zmq.ROUTER,
+                    bind=True,
+                    router_handover=enable_input_socket_handover,
                 )
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx, addresses.outputs[0], zmq.PULL
@@ -581,7 +595,6 @@ class MPClient(EngineCoreClient):
                         coordinator.get_stats_publish_address()
                     )
 
-            parallel_config = vllm_config.parallel_config
             dp_size = parallel_config.data_parallel_size
             dp_rank = parallel_config.data_parallel_index
             dp_local_size = parallel_config.data_parallel_size_local
@@ -609,8 +622,13 @@ class MPClient(EngineCoreClient):
                     timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
                 ):
                     raise TimeoutError(
-                        "Timed out waiting for engines to send "
-                        "initial message on input socket."
+                        f"Timed out waiting for engine core processes to "
+                        f"start. This is often caused by slow weight loading "
+                        f"for large models. Waited "
+                        f"{VLLM_ENGINE_READY_TIMEOUT_S}s (configured by "
+                        f"VLLM_ENGINE_READY_TIMEOUT_S). To increase the "
+                        f"timeout, set the environment variable: "
+                        f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
                     )
                 identity, _ = sync_input_socket.recv_multipart()
                 identities.remove(identity)
@@ -1355,7 +1373,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
-        if (eng_index := request.data_parallel_rank) is None:
+        if (eng_index := request.data_parallel_rank) is None and (
+            eng_index := get_late_interaction_engine_index(
+                request.pooling_params, len(self.core_engines)
+            )
+        ) is None:
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
@@ -1586,8 +1608,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
             ):
                 raise TimeoutError(
-                    "Timed out waiting for new engines to send initial "
-                    "message on input socket."
+                    f"Timed out waiting for new engine core processes to "
+                    f"start. Waited "
+                    f"{VLLM_ENGINE_READY_TIMEOUT_S}s (configured by "
+                    f"VLLM_ENGINE_READY_TIMEOUT_S). To increase the "
+                    f"timeout, set the environment variable: "
+                    f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
                 )
             identity, _ = sync_input_socket.recv_multipart()
             new_engine_identities.discard(identity)
