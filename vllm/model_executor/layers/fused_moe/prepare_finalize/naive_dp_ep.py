@@ -110,6 +110,7 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
+        lora_ids: torch.Tensor | None = None,
     ) -> mk.PrepareResultType:
         """Quantize and Dispatch Topk Weights and Topk Ids."""
 
@@ -123,22 +124,39 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
 
         a1q, scales = _quantize_and_setup_dispatch(a1, quant_config, defer_input_quant)
 
+        if lora_ids is not None:
+            extra_tensors = [lora_ids]
+            if scales is not None:
+                extra_tensors.extend(scales)
+        else:
+            extra_tensors = scales
+
         res = get_ep_group().dispatch(
             a1q,
             topk_weights,
             topk_ids,
             is_sequence_parallel=self.is_sequence_parallel,
-            extra_tensors=scales,
+            extra_tensors=extra_tensors,
         )
 
-        if scales is None:
+        # TODO: Maybe just make res a dataclass or namedtuple?
+        if extra_tensors is None:
             a1q, topk_weights, topk_ids = res
-            a1q_scale = None
         else:
-            a1q, topk_weights, topk_ids, scales = res
-            a1q_scale = _unwrap_scale_and_prepare_for_moe(scales, quant_config)
+            a1q, topk_weights, topk_ids, extra_tensors = res
+            if lora_ids is not None:
+                lora_ids = extra_tensors[0]
+            if scales is not None:
+                scales_begin = 0 if lora_ids is None else 1
+                scales = extra_tensors[scales_begin:]
+                a1q_scale = _unwrap_scale_and_prepare_for_moe(scales, quant_config)
 
-        return a1q, a1q_scale, None, topk_ids, topk_weights
+        expert_tokens_meta = mk.ExpertTokensMetadata(
+            expert_num_tokens=None,
+            expert_num_tokens_cpu=None,
+            lora_ids=lora_ids,
+        )
+        return a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights
 
     def finalize(
         self,

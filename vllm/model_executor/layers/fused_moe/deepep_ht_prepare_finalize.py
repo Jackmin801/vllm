@@ -263,6 +263,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
+        lora_ids: torch.Tensor | None = None,
     ) -> mk.ReceiverType:
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)

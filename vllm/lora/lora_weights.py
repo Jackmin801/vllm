@@ -97,7 +97,7 @@ class LoRALayerWeights:
 
 
 class PackedLoRALayerWeights(LoRALayerWeights):
-    """LoRA used for packed layers (eg. qkv_proj)."""
+    """LoRA used for packed layers (eg. qkv_proj, moe)."""
 
     def __init__(
         self,
