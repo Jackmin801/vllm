@@ -5,7 +5,7 @@ import torch
 # No activation quantization support
 # No TP support
 
-NUM_TOKENS = 2 ** 13 # Should do up to 262144 (2 ^ 18)
+NUM_TOKENS = 2 ** 18 # Should do up to 262144 (2 ^ 18)
 EP_RANK = 1
 EP_SIZE = 32 # 32 and 48 are what we will probably end up using
 LORA_RANK = 16
@@ -42,6 +42,7 @@ tune_max_num_tokens = NUM_TOKENS # This is just to inform the kernel what shapes
 
 # Lora specific
 # -1 means base model only, no LoRA
+# TODO: I think the reference doesnt cover this case, need to add it
 lora_ids = torch.randint(-1, MAX_LORAS, (NUM_TOKENS,), dtype=torch.int32)
 w1_lora_a = torch.randn(MAX_LORAS, LOCAL_EXPERTS, 2, LORA_RANK, HIDDEN_SIZE, dtype=torch.bfloat16) / math.sqrt(HIDDEN_SIZE)
 w1_lora_b = torch.randn(MAX_LORAS, LOCAL_EXPERTS, 2, MOE_INTERMEDIATE_SIZE, LORA_RANK, dtype=torch.bfloat16) / math.sqrt(LORA_RANK)
@@ -155,26 +156,47 @@ print_tensor_metadata()
 
 print("=== Starting output ===")
 print(output)
+
+# Warmup
 reference_moe_forward(
-    hidden_states,
-    topk_ids,
-    topk_weights,
-    w1,
-    w2,
-    q1,
-    q2,
-    output,
-    activation,
-    tune_max_num_tokens,
-    lora_ids,
-    w1_lora_a,
-    w1_lora_b,
-    w2_lora_a,
-    w2_lora_b,
-    workspace13,
-    workspace2,
-    workspace_reduce,
+    hidden_states, topk_ids, topk_weights, w1, w2, q1, q2, output,
+    activation, tune_max_num_tokens, lora_ids,
+    w1_lora_a, w1_lora_b, w2_lora_a, w2_lora_b,
+    workspace13, workspace2, workspace_reduce,
 )
+torch.cuda.synchronize()
+
+# Timed run
+NUM_ITERS = 10
+output.zero_()
+start = torch.cuda.Event(enable_timing=True)
+end = torch.cuda.Event(enable_timing=True)
+start.record()
+for _ in range(NUM_ITERS):
+    reference_moe_forward(
+        hidden_states, topk_ids, topk_weights, w1, w2, q1, q2, output,
+        activation, tune_max_num_tokens, lora_ids,
+        w1_lora_a, w1_lora_b, w2_lora_a, w2_lora_b,
+        workspace13, workspace2, workspace_reduce,
+    )
+end.record()
+torch.cuda.synchronize()
+elapsed_ms = start.elapsed_time(end) / NUM_ITERS
+
+# Theoretical FLOPs: 2 * num_tokens * top_k / ep_size * 3 * moe_intermediate_size * hidden_size
+# Factor of 3: gate, up, down projections
+theoretical_flops = 2 * NUM_TOKENS * TOP_K / EP_SIZE * 3 * MOE_INTERMEDIATE_SIZE * HIDDEN_SIZE
+theoretical_flops_lora = 2 * NUM_TOKENS * TOP_K / EP_SIZE * 3 * (MOE_INTERMEDIATE_SIZE * LORA_RANK + LORA_RANK * HIDDEN_SIZE)
+peak_flops = 2e15  # 2 PFLOPS tensor core peak (H100)
+elapsed_s = elapsed_ms / 1000.0
+achieved_flops = theoretical_flops / elapsed_s
+mfu = achieved_flops / peak_flops
+
+print(f"\n=== Timing ===")
+print(f"Average time per forward: {elapsed_ms:.3f} ms")
+print(f"Theoretical FLOPs: {theoretical_flops:.3e}")
+print(f"Achieved FLOPS: {achieved_flops:.3e}")
+print(f"MFU: {mfu:.4f} ({mfu * 100:.2f}%)")
 
 print("=== Ending output ===")
 print(output)
