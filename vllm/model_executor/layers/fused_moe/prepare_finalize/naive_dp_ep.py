@@ -140,6 +140,7 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         )
 
         # TODO: Maybe just make res a dataclass or namedtuple?
+        a1q_scale = None
         if extra_tensors is None:
             a1q, topk_weights, topk_ids = res
         else:
