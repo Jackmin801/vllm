@@ -864,6 +864,10 @@ class FusedMoEExpertsModular(FusedMoEExperts):
     ) -> None:
         apply_moe_activation(activation, output, input)
 
+    def supports_lora(self) -> bool:
+        """Whether this experts implementation supports LoRA weights."""
+        return False
+
     @abstractmethod
     def finalize_weight_and_reduce_impl(self) -> TopKWeightAndReduce:
         raise NotImplementedError
@@ -886,6 +890,10 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         workspace2: torch.Tensor,
         expert_tokens_meta: ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        w1_lora_a: torch.Tensor | None,
+        w1_lora_b: torch.Tensor | None,
+        w2_lora_a: torch.Tensor | None,
+        w2_lora_b: torch.Tensor | None,
     ) -> None:
         """
         This function computes the intermediate result of a Mixture of Experts
@@ -921,6 +929,10 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         - apply_router_weight_on_input: True if router weights are already
           applied on the input. This is relevant if the implementation
           chooses to do weight application.
+        - w1_lora_a: Optional LoRA A matrices for w1/w3 (gate+up).
+        - w1_lora_b: Optional LoRA B matrices for w1/w3 (gate+up).
+        - w2_lora_a: Optional LoRA A matrices for w2 (down).
+        - w2_lora_b: Optional LoRA B matrices for w2 (down).
         """
         raise NotImplementedError
 
@@ -1209,6 +1221,10 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
+        lora_kwargs = {}
+        if self.fused_experts.supports_lora() and hasattr(self, "lora_weights"):
+            lora_kwargs = self.lora_weights
+
         self.fused_experts.apply(
             output=fused_out,
             hidden_states=a1q,
@@ -1225,6 +1241,7 @@ class FusedMoEKernelModularImpl:
             workspace2=workspace2,
             expert_tokens_meta=expert_tokens_meta,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            **lora_kwargs,
         )
 
         return fused_out
