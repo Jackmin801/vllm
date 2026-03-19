@@ -210,6 +210,21 @@ def make_unquantized_moe_kernel(
     quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
 ) -> mk.FusedMoEKernel | None:
+    from vllm import envs
+
+    if envs.VLLM_MOE_USE_TORCH_NAIVE:
+        from vllm.model_executor.layers.fused_moe.torch_naive_moe import (
+            TorchNaiveFusedMoEExperts,
+        )
+
+        return mk.FusedMoEKernel(
+            MoEPrepareAndFinalizeNoDPEPModular(),
+            TorchNaiveFusedMoEExperts(
+                moe_config=moe_config,
+                quant_config=quant_config,
+            ),
+        )
+
     if backend in UNSUPPORTED_BACKEND:
         return None
 

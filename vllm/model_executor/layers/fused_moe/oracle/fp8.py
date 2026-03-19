@@ -532,6 +532,16 @@ def make_fp8_moe_kernel(
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     shared_experts: torch.nn.Module | None = None,
 ) -> mk.FusedMoEKernel:
+    from vllm import envs
+
+    if envs.VLLM_MOE_USE_TORCH_NAIVE:
+        from vllm.model_executor.layers.fused_moe.torch_naive_moe import (
+            TorchNaiveFusedMoEExperts,
+        )
+
+        experts_cls = TorchNaiveFusedMoEExperts
+        logger.info_once("VLLM_MOE_USE_TORCH_NAIVE: using TorchNaiveFusedMoEExperts")
+
     # Create Prepare/Finalize.
     prepare_finalize = maybe_make_prepare_finalize(
         moe=moe_config,
