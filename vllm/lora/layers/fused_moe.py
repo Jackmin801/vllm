@@ -59,6 +59,30 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             moe_mk.punica_wrapper = punica_wrapper
         else:
             raise ValueError("MoE LoRA requires a modular kernel.")
+        self._attach_lora_weights()
+
+    def _attach_lora_weights(self):
+        """Store LoRA weight references on the modular kernel impl so they
+        get passed through to experts.apply() at forward time."""
+        moe_mk = self.base_layer.quant_method.moe_kernel.impl
+        if not moe_mk.fused_experts.supports_lora():
+            raise ValueError(
+                f"{type(moe_mk.fused_experts).__name__} does not support "
+                "LoRA. Set VLLM_MOE_USE_TORCH_NAIVE=1 for LoRA support."
+            )
+        if hasattr(self, "w13_lora_a_stacked"):
+            # Ensure non-blocking copies have completed before stacking
+            torch.cuda.synchronize()
+            # Stack slices into single tensors:
+            #   w13_lora_a: (num_slices, max_loras, E, rank, hidden)
+            #   w13_lora_b: (num_slices, max_loras, E, inter, rank)
+            #   w2_lora_a/b: squeeze the trivial tuple wrapper
+            moe_mk.lora_weights = {
+                "w13_lora_a": torch.stack(self.w13_lora_a_stacked),
+                "w13_lora_b": torch.stack(self.w13_lora_b_stacked),
+                "w2_lora_a": self.w2_lora_a_stacked[0],
+                "w2_lora_b": self.w2_lora_b_stacked[0],
+            }
 
     def _normalize_keys(self, config: dict[str, int | None]) -> dict[str, int | None]:
         normalized_config = {}
@@ -525,6 +549,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w2_lora_a_stacked[0][index] = 0
         self.w2_lora_b_stacked[0][index] = 0
         self.adapter_enabled[index] = 0
+        self._attach_lora_weights()
 
     #
 
@@ -587,6 +612,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w2_lora_b_stacked[0][
             index, :, : sliced_w2_lora_b.shape[1], : sliced_w2_lora_b.shape[2]
         ].copy_(sliced_w2_lora_b, non_blocking=True)
+
+        self._attach_lora_weights()
 
     def forward(self, *args, **kwargs):
         return self.base_layer.forward(*args, **kwargs)
@@ -740,6 +767,8 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
         self.w2_lora_b_stacked[0][
             index, :, : sliced_w2_lora_b.shape[1], : sliced_w2_lora_b.shape[2]
         ].copy_(sliced_w2_lora_b, non_blocking=True)
+
+        self._attach_lora_weights()
 
     @property
     def w13_input_size(self):
