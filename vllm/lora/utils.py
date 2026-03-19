@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import re
 from typing import TYPE_CHECKING
 
 import huggingface_hub
@@ -281,6 +282,35 @@ def get_adapter_absolute_path(lora_path: str) -> str:
     return local_snapshot_path
 
 
+def _get_expert_map_from_model(model: nn.Module):
+    """Get the expert_map from the first FusedMoE layer, if EP is active."""
+    for module in model.modules():
+        if (isinstance(module, FusedMoE)
+                and hasattr(module, '_expert_map')
+                and module._expert_map is not None):
+            return module._expert_map
+    return None
+
+
+def _filter_experts_for_ep(
+    entries: list[str],
+    expert_map,
+) -> list[str]:
+    """Filter expert entries to only include local experts based on
+    expert_map. Entries have format 'experts.{global_id}...'."""
+    filtered = []
+    for entry in entries:
+        m = re.match(r"experts\.(\d+)", entry)
+        if m is None:
+            # Not an expert entry, keep it
+            filtered.append(entry)
+            continue
+        global_id = int(m.group(1))
+        if global_id < len(expert_map) and expert_map[global_id] != -1:
+            filtered.append(entry)
+    return filtered
+
+
 def process_packed_modules_mapping(model: nn.Module) -> dict[str, list[str]]:
     if is_moe_model(model):
         if moe_packed_mapping := get_moe_expert_mapping(model):
@@ -295,11 +325,20 @@ def process_packed_modules_mapping(model: nn.Module) -> dict[str, list[str]]:
                 # Filter out malformed entries: non-gated MoE has empty
                 # ckpt_up_proj_name which results in weight_name containing ".."
                 # (e.g., "experts.0.." instead of "experts.0.layer_name.")
-                packed_modules_mapping["experts"] = [
+                experts_list = [
                     weight_name.rstrip(".")
                     for _, weight_name, _, _ in moe_packed_mapping
                     if ".." not in weight_name
                 ]
+
+                # When EP is active, filter to only local experts
+                expert_map = _get_expert_map_from_model(model)
+                if expert_map is not None:
+                    experts_list = _filter_experts_for_ep(
+                        experts_list, expert_map
+                    )
+
+                packed_modules_mapping["experts"] = experts_list
 
             return packed_modules_mapping
         else:

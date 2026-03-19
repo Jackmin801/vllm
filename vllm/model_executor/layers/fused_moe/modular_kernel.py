@@ -96,6 +96,9 @@ class ExpertTokensMetadata:
 
     expert_num_tokens: torch.Tensor
     expert_num_tokens_cpu: torch.Tensor | None
+    # Per-token LoRA adapter index, shape (num_tokens,). None when no LoRA
+    # adapters are active.
+    lora_ids: torch.Tensor | None = None
 
     @staticmethod
     def make_from_list(
@@ -253,6 +256,7 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
+        lora_ids: torch.Tensor | None = None,
     ) -> PrepareResultType:
         """
         Perform any quantization (and/or) dispatching needed for this kernel.
@@ -268,6 +272,8 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
         - defer_input_quant: Runtime parameter indicating whether or not to
           defer input quantization to the FusedMoEExpertsModular
           in cases where the compute kernel expects unquantized inputs
+        - lora_ids: Optional per-token LoRA adapter index, shape
+          (num_tokens,). None when no LoRA adapters are active.
 
         Returns a tuple of:
         - quantized + dispatched a.
@@ -297,6 +303,7 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
+        lora_ids: torch.Tensor | None = None,
     ) -> tuple[Callable, ReceiverType] | ReceiverType:
         """
         Perform any quantization (and/or) dispatching needed for this kernel
@@ -315,6 +322,8 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
         - defer_input_quant: Runtime parameter indicating whether or not to
           defer input quantization to the FusedMoEExpertsModular
           in cases where the compute kernel expects unquantized inputs
+        - lora_ids: Optional per-token LoRA adapter index, shape
+          (num_tokens,). None when no LoRA adapters are active.
 
         Returns a callback or a hook callback pair that when invoked waits for
         results from other workers and has the same return signature as
@@ -855,6 +864,10 @@ class FusedMoEExpertsModular(FusedMoEExperts):
     ) -> None:
         apply_moe_activation(activation, output, input)
 
+    def supports_lora(self) -> bool:
+        """Whether this experts implementation supports LoRA weights."""
+        return False
+
     @abstractmethod
     def finalize_weight_and_reduce_impl(self) -> TopKWeightAndReduce:
         raise NotImplementedError
@@ -877,6 +890,10 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         workspace2: torch.Tensor,
         expert_tokens_meta: ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        w1_lora_a: torch.Tensor | None,
+        w1_lora_b: torch.Tensor | None,
+        w2_lora_a: torch.Tensor | None,
+        w2_lora_b: torch.Tensor | None,
     ) -> None:
         """
         This function computes the intermediate result of a Mixture of Experts
@@ -912,6 +929,10 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         - apply_router_weight_on_input: True if router weights are already
           applied on the input. This is relevant if the implementation
           chooses to do weight application.
+        - w1_lora_a: Optional LoRA A matrices for w1/w3 (gate+up).
+        - w1_lora_b: Optional LoRA B matrices for w1/w3 (gate+up).
+        - w2_lora_a: Optional LoRA A matrices for w2 (down).
+        - w2_lora_b: Optional LoRA B matrices for w2 (down).
         """
         raise NotImplementedError
 
@@ -1074,6 +1095,7 @@ class FusedMoEKernelModularImpl:
         global_num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
+        lora_ids: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -1106,6 +1128,7 @@ class FusedMoEKernelModularImpl:
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
                 defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                lora_ids=lora_ids,
             )
         else:
             # Overlap shared expert compute with all2all dispatch.
@@ -1119,6 +1142,7 @@ class FusedMoEKernelModularImpl:
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
                 defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                lora_ids=lora_ids,
             )
 
             # TODO(lucas): refactor this in the alternative schedules followup
@@ -1197,6 +1221,10 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
+        lora_kwargs = {}
+        if self.fused_experts.supports_lora() and hasattr(self, "lora_weights"):
+            lora_kwargs = self.lora_weights
+
         self.fused_experts.apply(
             output=fused_out,
             hidden_states=a1q,
@@ -1213,6 +1241,7 @@ class FusedMoEKernelModularImpl:
             workspace2=workspace2,
             expert_tokens_meta=expert_tokens_meta,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            **lora_kwargs,
         )
 
         return fused_out
@@ -1349,6 +1378,11 @@ class FusedMoEKernelModularImpl:
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
+        
+        if hasattr(self, "punica_wrapper"):
+            lora_ids = self.punica_wrapper.token_lora_indices
+        else:
+            lora_ids = None
 
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             hidden_states,
@@ -1357,6 +1391,7 @@ class FusedMoEKernelModularImpl:
             global_num_experts,
             expert_map,
             apply_router_weight_on_input,
+            lora_ids=lora_ids,
         )
 
         fused_out = self._fused_experts(

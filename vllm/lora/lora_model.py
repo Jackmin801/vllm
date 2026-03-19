@@ -179,7 +179,13 @@ class LoRAModel:
                     expert_idx = module_name.find(".experts")
                     expert_suffix = module_name[expert_idx + 1 :]
                     if expert_suffix not in expected_lora_modules:
-                        unexpected_modules.append(module_name)
+                        # With EP, each rank only has a subset of experts
+                        # in expected_lora_modules. Accept any expert
+                        # sub-module if "experts" itself is expected —
+                        # non-local expert weights are skipped during
+                        # loading.
+                        if "experts" not in expected_lora_modules:
+                            unexpected_modules.append(module_name)
 
                 elif module_name.rsplit(".", 1)[-1] not in expected_lora_modules:
                     unexpected_modules.append(module_name)

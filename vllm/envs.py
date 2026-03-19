@@ -834,6 +834,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "0").strip().lower()
         in ("1", "true")
     ),
+    # If set, forces the torch naive MoE experts implementation to be used.
+    # Slow but correct — intended for testing LoRA + EP end-to-end.
+    "VLLM_MOE_USE_TORCH_NAIVE": lambda: (
+        os.environ.get("VLLM_MOE_USE_TORCH_NAIVE", "0").strip().lower()
+        in ("1", "true")
+    ),
     # If set, forces FP8 Marlin to be used for FP8 quantization regardless
     # of the hardware support for FP8 compute.
     "VLLM_TEST_FORCE_FP8_MARLIN": lambda: (
