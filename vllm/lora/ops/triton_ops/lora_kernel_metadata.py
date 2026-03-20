@@ -100,6 +100,7 @@ class LoRAKernelMeta:
         )
 
     def _reset(self):
+        self.token_lora_mapping.fill_(-1)
         self.active_lora_ids.fill_(-1)
         self.num_tokens_per_lora.fill_(0)
         self.lora_token_start_loc.fill_(0)

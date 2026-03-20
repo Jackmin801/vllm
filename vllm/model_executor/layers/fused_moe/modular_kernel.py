@@ -890,8 +890,8 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         workspace2: torch.Tensor,
         expert_tokens_meta: ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
-        w1_lora_a: torch.Tensor | None,
-        w1_lora_b: torch.Tensor | None,
+        w13_lora_a: torch.Tensor | None,
+        w13_lora_b: torch.Tensor | None,
         w2_lora_a: torch.Tensor | None,
         w2_lora_b: torch.Tensor | None,
     ) -> None:
@@ -929,8 +929,8 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         - apply_router_weight_on_input: True if router weights are already
           applied on the input. This is relevant if the implementation
           chooses to do weight application.
-        - w1_lora_a: Optional LoRA A matrices for w1/w3 (gate+up).
-        - w1_lora_b: Optional LoRA B matrices for w1/w3 (gate+up).
+        - w13_lora_a: Optional LoRA A matrices for w1/w3 (gate+up).
+        - w13_lora_b: Optional LoRA B matrices for w1/w3 (gate+up).
         - w2_lora_a: Optional LoRA A matrices for w2 (down).
         - w2_lora_b: Optional LoRA B matrices for w2 (down).
         """

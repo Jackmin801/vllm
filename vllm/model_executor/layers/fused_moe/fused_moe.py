@@ -52,6 +52,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -1897,6 +1898,77 @@ def fused_experts_impl(
     return out_hidden_states
 
 
+def _normalize_lora_config_keys(
+    config: dict[str, int | None],
+) -> dict[str, int | None]:
+    """Normalize config keys to uppercase BLOCK_SIZE_* format."""
+    normalized_config = {}
+    for key, value in config.items():
+        if key.islower():
+            if key.startswith("block_"):
+                normalized_key = "BLOCK_SIZE_" + key.split("_")[-1].upper()
+            else:
+                normalized_key = key.upper()
+        else:
+            normalized_key = key
+        normalized_config[normalized_key] = value
+    return normalized_config
+
+
+def _get_lora_moe_configs(
+    op_prefix: str,
+    num_loras: int,
+    rank: int,
+    num_slices: int,
+    M: int,
+    hidden_size: int,
+    intermediate_size: int,
+    w1_shape: torch.Size,
+    w2_shape: torch.Size,
+    top_k: int,
+    config_dtype: str,
+    block_shape: list[int] | None,
+) -> tuple[dict, dict]:
+    """Compute shrink/expand configs for LoRA MoE operations."""
+    if envs.VLLM_TUNED_CONFIG_FOLDER:
+        from vllm.lora.ops.triton_ops.utils import get_lora_op_configs
+
+        shrink_config = get_lora_op_configs(
+            op_type=f"fused_moe_lora_{op_prefix}_shrink",
+            max_loras=num_loras,
+            batch=M,
+            hidden_size=hidden_size,
+            rank=rank,
+            num_slices=num_slices,
+            moe_intermediate_size=intermediate_size,
+        )
+        expand_config = get_lora_op_configs(
+            op_type=f"fused_moe_lora_{op_prefix}_expand",
+            max_loras=num_loras,
+            batch=M,
+            hidden_size=hidden_size,
+            rank=rank,
+            num_slices=num_slices,
+            moe_intermediate_size=intermediate_size,
+        )
+    else:
+        base_config = try_get_optimal_moe_config(
+            w1_shape, w2_shape, top_k, config_dtype, M, block_shape
+        )
+        shrink_config = base_config.copy()
+        shrink_config["BLOCK_SIZE_N"] = min(
+            shrink_config.get("BLOCK_SIZE_N", 64), next_power_of_2(rank)
+        )
+        expand_config = base_config.copy()
+        expand_config["BLOCK_SIZE_K"] = max(
+            16,
+            min(expand_config.get("BLOCK_SIZE_K", 32), next_power_of_2(rank)),
+        )
+    shrink_config = _normalize_lora_config_keys(shrink_config)
+    expand_config = _normalize_lora_config_keys(expand_config)
+    return shrink_config, expand_config
+
+
 class TritonExperts(mk.FusedMoEExpertsModular):
     """Triton-based fused MoE expert implementation."""
 
@@ -1970,6 +2042,16 @@ class TritonExperts(mk.FusedMoEExpertsModular):
     def supports_expert_map(self) -> bool:
         return True
 
+    def supports_lora(self) -> bool:
+        return True
+
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        # When LoRA is configured, defer quantization so we can use
+        # BF16 hidden_states for the LoRA computation. We quantize
+        # internally before GEMM1 so the total work is the same.
+        return getattr(self, "punica_wrapper", None) is not None
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -2007,6 +2089,10 @@ class TritonExperts(mk.FusedMoEExpertsModular):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        w13_lora_a: torch.Tensor | None = None,
+        w13_lora_b: torch.Tensor | None = None,
+        w2_lora_a: torch.Tensor | None = None,
+        w2_lora_b: torch.Tensor | None = None,
     ):
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
@@ -2034,6 +2120,31 @@ class TritonExperts(mk.FusedMoEExpertsModular):
 
         if global_num_experts == -1:
             global_num_experts = E
+
+        # Only apply LoRA when weights exist AND lora_ids are present
+        # (i.e. at least one adapter is active for this batch).
+        lora_ids = (expert_tokens_meta.lora_ids
+                    if expert_tokens_meta is not None else None)
+        has_lora = w13_lora_a is not None and lora_ids is not None
+
+        # When LoRA is active, expects_unquantized_inputs=True causes
+        # prepare to defer quantization so we receive BF16 here.
+        # Quantize internally for GEMM but keep BF16 for LoRA.
+        hidden_states_bf16 = None
+        if (
+            has_lora
+            and hidden_states.dtype not in (
+                torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            and self.quant_dtype is not None
+        ):
+            hidden_states_bf16 = hidden_states
+            hidden_states, a1q_scale = moe_kernel_quantize_input(
+                hidden_states,
+                a1q_scale,
+                self.quant_dtype,
+                self.per_act_token_quant,
+                self.block_shape,
+            )
 
         config = try_get_optimal_moe_config(
             w1.size(),
@@ -2093,6 +2204,28 @@ class TritonExperts(mk.FusedMoEExpertsModular):
             B_bias=self.w1_bias,
         )
 
+        if has_lora:
+            lora_input = (hidden_states_bf16
+                          if hidden_states_bf16 is not None
+                          else hidden_states)
+            self._apply_lora(
+                intermediate_cache1.view(-1, top_k_num, N),
+                lora_input,
+                w13_lora_a,
+                w13_lora_b,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                top_k_num,
+                num_tokens,
+                E,
+                K,
+                w1,
+                w2,
+                expert_tokens_meta,
+                op_prefix="w13",
+            )
+
         self.activation(
             activation, intermediate_cache2, intermediate_cache1.view(-1, N)
         )
@@ -2130,14 +2263,165 @@ class TritonExperts(mk.FusedMoEExpertsModular):
             B_bias=self.w2_bias,
         )
 
-        # separate function is required for MoE + LoRA
+        if has_lora:
+            self._apply_lora(
+                intermediate_cache3,
+                intermediate_cache2,
+                (w2_lora_a,),
+                (w2_lora_b,),
+                topk_weights,
+                topk_ids,
+                expert_map,
+                top_k_num,
+                num_tokens,
+                E,
+                K,
+                w1,
+                w2,
+                expert_tokens_meta,
+                op_prefix="w2",
+                mul_routed_weight=True,
+            )
+
         self.moe_sum(intermediate_cache3, output)
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         ops.moe_sum(input, output)
 
+    def _apply_lora(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a: torch.Tensor | tuple[torch.Tensor, ...],
+        lora_b: torch.Tensor | tuple[torch.Tensor, ...],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        top_k_num: int,
+        num_tokens: int,
+        num_experts: int,
+        hidden_size: int,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        op_prefix: str,
+        mul_routed_weight: bool = False,
+    ) -> None:
+        """Apply LoRA corrections using punica triton ops.
+
+        Args:
+            topk_ids: Global expert IDs (expert_map applied by alignment).
+            expert_map: Maps global to local expert IDs, passed to alignment.
+            expert_tokens_meta: Contains post-dispatch lora_ids.
+        """
+        # Convert stacked tensor to tuple if needed (w13 comes stacked)
+        if isinstance(lora_a, torch.Tensor):
+            lora_a_stacked = lora_a.unbind(0)
+            lora_b_stacked = lora_b.unbind(0)
+        else:
+            lora_a_stacked = lora_a
+            lora_b_stacked = lora_b
+
+        max_lora_rank = lora_a_stacked[0].shape[-2]
+        num_slices = len(lora_a_stacked)
+
+        config_dtype = _get_config_dtype_str(
+            dtype=x.dtype,
+            use_fp8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+        )
+
+        shrink_config, expand_config = _get_lora_moe_configs(
+            op_prefix=op_prefix,
+            num_loras=self.max_loras,
+            rank=max_lora_rank,
+            num_slices=num_slices,
+            M=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=(
+                lora_a_stacked[0].shape[-1]
+                if op_prefix == "w2"
+                else lora_b_stacked[0].shape[-2]
+            ),
+            w1_shape=w1.size(),
+            w2_shape=w2.size(),
+            top_k=top_k_num,
+            config_dtype=config_dtype,
+            block_shape=self.block_shape,
+        )
+
+        # Use post-dispatch lora_ids from expert_tokens_meta as the
+        # token-to-adapter mapping. This is correct for both EP and
+        # non-EP since prepare already dispatches lora_ids.
+        lora_ids = (
+            expert_tokens_meta.lora_ids
+            if expert_tokens_meta is not None
+            else None
+        )
+
+        # Pass global topk_ids and expert_map to alignment. The
+        # alignment kernel works with global expert IDs and applies
+        # expert_map to the output expert_ids.
+        SPARSITY_FACTOR = 8
+        naive_block_assignment = (
+            expert_map is None
+            and num_tokens * top_k_num * SPARSITY_FACTOR
+            <= num_experts * self.max_loras
+        )
+
+        (
+            token_lora_mapping,
+            sorted_token_ids_lora,
+            expert_ids_lora,
+            num_tokens_post_padded_lora,
+        ) = self.punica_wrapper.moe_lora_align_block_size(
+            topk_ids,
+            num_tokens,
+            shrink_config["BLOCK_SIZE_M"],
+            num_experts,
+            self.max_loras,
+            self.adapter_enabled,
+            expert_map=expert_map,
+            naive_block_assignment=naive_block_assignment,
+        )
+
+        if sorted_token_ids_lora is not None:
+            expert_ids_lora = expert_ids_lora.view(self.max_loras, -1)
+            sorted_token_ids_lora = sorted_token_ids_lora.view(
+                self.max_loras, -1
+            )
+
+        offset = 0
+        if op_prefix == "w2" and self.fully_sharded:
+            shard_size = hidden_size // self.lora_tp_size
+            offset = shard_size * self.lora_tp_rank
+
+        self.punica_wrapper.add_lora_fused_moe(
+            y,
+            x,
+            lora_a_stacked,
+            lora_b_stacked,
+            topk_weights,
+            sorted_token_ids_lora,
+            expert_ids_lora,
+            num_tokens_post_padded_lora,
+            max_lora_rank,
+            top_k_num,
+            shrink_config,
+            expand_config,
+            self.adapter_enabled,
+            mul_routed_weight,
+            fully_sharded=self.fully_sharded,
+            offset=offset,
+            token_lora_mapping=lora_ids,
+        )
+
 
 class TritonWNA16Experts(TritonExperts):
+    def supports_lora(self) -> bool:
+        return False
+
     @staticmethod
     def _supports_current_device() -> bool:
         raise NotImplementedError(
