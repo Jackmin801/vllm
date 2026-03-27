@@ -333,16 +333,23 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         expert_map: torch.Tensor | None = None,
         pad_sorted_ids: bool = False,
         naive_block_assignment: bool = False,
+        token_lora_mapping: torch.Tensor | None = None,
+        lora_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Aligns tokens and experts into block-sized chunks for LoRA-based
         mixture-of-experts (MoE) execution.
         """
-        (token_lora_mapping, _, _, _, lora_ids, _, _) = (
-            self.token_mapping_meta.meta_args(
-                num_tokens, self.lora_config.specialize_active_lora
+        if token_lora_mapping is None:
+            (token_lora_mapping, _, _, _, lora_ids_local, _, _) = (
+                self.token_mapping_meta.meta_args(
+                    num_tokens, self.lora_config.specialize_active_lora
+                )
             )
-        )
+            if lora_ids is None:
+                lora_ids = lora_ids_local
+        elif lora_ids is None:
+            lora_ids = self.token_mapping_meta.active_lora_ids
         if naive_block_assignment:
             expert_ids = topk_ids.reshape(-1)
             sorted_ids = None
@@ -359,13 +366,18 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                 device=topk_ids.device,
             )
             max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-            # Expert ids must be set default to -1 to prevent a blank block
-            expert_ids = torch.empty(
+            # Zero-initialize expert_ids and num_tokens_post_pad so that
+            # inactive LoRA adapters (whose C++ kernel blocks exit early
+            # without writing) have safe default values.  This is critical
+            # when EP is active because the post-hoc expert_map[expert_ids]
+            # remap touches every element — uninitialized garbage values
+            # would cause an out-of-bounds access.
+            expert_ids = torch.zeros(
                 (max_loras * max_num_m_blocks,),
                 dtype=torch.int32,
                 device=topk_ids.device,
             )
-            num_tokens_post_pad = torch.empty(
+            num_tokens_post_pad = torch.zeros(
                 (max_loras), dtype=torch.int32, device=topk_ids.device
             )
 
@@ -407,23 +419,36 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         fully_sharded: bool = False,
         offset: int = 0,
         token_lora_mapping: torch.Tensor | None = None,
+        lora_ids: torch.Tensor | None = None,
+        num_active_loras: torch.Tensor | None = None,
     ):
         """
         Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
         """
-        (
-            token_lora_mapping_meta,
-            _,
-            _,
-            _,
-            lora_ids,
-            _,
-            num_active_loras,
-        ) = self.token_mapping_meta.meta_args(
-            x.size(0), self.lora_config.specialize_active_lora
-        )
-        if token_lora_mapping is None:
-            token_lora_mapping = token_lora_mapping_meta
+        if lora_ids is None or num_active_loras is None:
+            (
+                token_lora_mapping_meta,
+                _,
+                _,
+                _,
+                lora_ids_meta,
+                _,
+                num_active_loras_meta,
+            ) = self.token_mapping_meta.meta_args(
+                x.size(0), self.lora_config.specialize_active_lora
+            )
+            if token_lora_mapping is None:
+                token_lora_mapping = token_lora_mapping_meta
+            if lora_ids is None:
+                lora_ids = lora_ids_meta
+            if num_active_loras is None:
+                num_active_loras = num_active_loras_meta
+        elif token_lora_mapping is None:
+            (token_lora_mapping, _, _, _, _, _, _) = (
+                self.token_mapping_meta.meta_args(
+                    x.size(0), self.lora_config.specialize_active_lora
+                )
+            )
         fused_moe_lora(
             y,
             x,
