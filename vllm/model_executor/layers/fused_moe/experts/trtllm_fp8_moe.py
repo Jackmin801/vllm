@@ -83,10 +83,11 @@ class TrtLlmFp8ExpertsBase:
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
         """Monolithic kernel so only use with naive DP/EP and TP."""
-        return (
-            not moe_parallel_config.use_all2all_kernels
-            or moe_parallel_config.use_ag_rs_all2all_kernels
-        ) and not moe_parallel_config.enable_eplb
+        return True
+        # return (
+        #     not moe_parallel_config.use_all2all_kernels
+        #     or moe_parallel_config.use_ag_rs_all2all_kernels
+        # ) and not moe_parallel_config.enable_eplb
 
     def supports_chunking(self) -> bool:
         return False
