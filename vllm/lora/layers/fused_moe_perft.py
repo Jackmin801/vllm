@@ -106,9 +106,30 @@ class FusedMoEWithPERFTE(BaseLayerWithLoRA):
         return isinstance(source_layer, FusedMoE) and envs.VLLM_MOE_LORA_USE_PERFTE
 
     #===============================================
+    # Passthrough methods
+    #===============================================
+    def maybe_all_reduce_tensor_model_parallel(self, *args, **kwargs):
+        return self.base_layer.maybe_all_reduce_tensor_model_parallel(*args, **kwargs)
+
+    @property
+    def _shared_experts(self):
+        return self.base_layer._shared_experts
+
+    @property
+    def quant_method(self):
+        return self.base_layer.quant_method
+
+    @property
+    def is_internal_router(self) -> bool:
+        return self.base_layer.is_internal_router
+
+    #===============================================
     # Forward with parallel LoRA path
     #===============================================
-    def forward(self, hidden_states, router_logits):
+    def forward(self, *args, **kwargs):
+        return self.base_layer.forward(*args, **kwargs)
+
+    def forward_without_moe_runner(self, hidden_states, router_logits):
         shared_output, fused_output = self.base_layer.forward(
             hidden_states, router_logits)
 
@@ -234,21 +255,3 @@ try:
     apply_perfte_lora = torch.ops.vllm.apply_perfte_lora
 except AttributeError:
     apply_perfte_lora = _apply_perfte_lora
-
-    #===============================================
-    # Passthrough methods
-    #===============================================
-    def maybe_all_reduce_tensor_model_parallel(self, *args, **kwargs):
-        return self.base_layer.maybe_all_reduce_tensor_model_parallel(*args, **kwargs)
-
-    @property
-    def _shared_experts(self):
-        return self.base_layer._shared_experts
-
-    @property
-    def quant_method(self):
-        return self.base_layer.quant_method
-
-    @property
-    def is_internal_router(self) -> bool:
-        return self.base_layer.is_internal_router
