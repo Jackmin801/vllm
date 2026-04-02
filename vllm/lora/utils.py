@@ -22,7 +22,6 @@ from vllm.lora.layers import (
     FusedMoE3DWithLoRA,
     FusedMoEWithLoRA,
     FusedMoEWithPERFTE,
-    GateLinearWithLoRA,
     LogitsProcessorWithLoRA,
     MergedColumnParallelLinearVariableSliceWithLoRA,
     MergedColumnParallelLinearWithLoRA,
