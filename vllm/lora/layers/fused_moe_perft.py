@@ -53,6 +53,10 @@ class FusedMoEWithPERFTE(BaseLayerWithLoRA):
         model_config: PretrainedConfig | None = None,
     ) -> None:
         """Initializes lora matrices."""
+        assert lora_config.max_lora_rank % 8 == 0, (
+            f"PERFT-E requires max_lora_rank to be a multiple of 8 for "
+            f"grouped_mm alignment, got {lora_config.max_lora_rank}"
+        )
         self.max_loras = max_loras
 
         self.adapter_enabled = torch.zeros(
@@ -142,59 +146,69 @@ def _apply_perfte_lora(
 ) -> None:
     """Apply LoRA as a parallel path respecting MoE routing and adapter IDs.
 
+    Uses torch.nn.functional.grouped_mm for efficient grouped GEMM where
+    groups correspond to experts. Tokens are sorted by expert ID to form
+    contiguous groups.
+
     Fully branchless — no data-dependent control flow — so it is safe under
     both torch.compile(fullgraph=True) and CUDA-graph capture.  Inactive
     tokens/adapters produce zero contribution via mask multiplication.
-
-    For each adapter slot (loop count is a compile-time constant):
-      1. Build a per-token mask from token_lora_indices & adapter_enabled
-      2. Project ALL tokens through lora_a for all experts (einsum)
-      3. Select the routed experts per token (gather)
-      4. Project through lora_b per top-k slot (bmm)
-      5. Mask and accumulate into output
     """
+    N = hidden_states.shape[0]
     top_k = topk_ids.shape[1]
-    rank = lora_a.shape[2]
+    num_experts = lora_a.shape[1]
+    H = hidden_states.shape[1]
     num_adapters = lora_a.shape[0]
+    M = N * top_k
     x = hidden_states.to(lora_a.dtype)
+
+    # Expand x for all top_k slots: [N, H] -> [M, H]
+    x_expanded = x.unsqueeze(1).expand(-1, top_k, -1).reshape(M, H)
+    flat_expert_ids = topk_ids.reshape(M)              # [M]
+    flat_weights = topk_weights.reshape(M, 1)          # [M, 1]
+
+    # Sort by expert ID to form contiguous groups for grouped_mm
+    sorted_expert_ids, sort_indices = flat_expert_ids.sort()
+    sorted_x = x_expanded[sort_indices]                # [M, H]
+
+    # Build offsets: offs[e] = cumulative count of tokens for experts 0..e
+    expert_counts = torch.zeros(
+        num_experts, dtype=torch.int32, device=hidden_states.device)
+    expert_counts.scatter_add_(
+        0, sorted_expert_ids.to(torch.int32),
+        torch.ones(M, dtype=torch.int32, device=hidden_states.device))
+    offs = expert_counts.cumsum(0).to(torch.int32)  # [num_experts]
 
     for adapter_idx in range(num_adapters):
         # Per-token mask: 1.0 for tokens using this adapter, 0.0 otherwise.
-        # adapter_enabled[adapter_idx] is a 0-dim GPU tensor (no CPU sync).
         mask = (
             (token_lora_indices == adapter_idx) & adapter_enabled[adapter_idx]
-        ).unsqueeze(1).to(lora_a.dtype)  # [N, 1]
+        ).to(lora_a.dtype)  # [N]
+        flat_mask = mask.unsqueeze(1).expand(-1, top_k).reshape(M, 1)
 
-        # Step 1: x @ lora_a for all experts via einsum
-        # [N, H] x [E, r, H] -> [N, E, r]
-        intermediate = torch.einsum('nh,erh->ner', x, lora_a[adapter_idx])
+        # lora_a[adapter_idx]: [E, r, H], lora_b[adapter_idx]: [E, H, r]
+        la = lora_a[adapter_idx]  # [E, r, H]
+        lb = lora_b[adapter_idx]  # [E, H, r]
 
-        # Step 2: select only routed experts
-        # [N, E, r] -> [N, top_k, r]
-        intermediate_selected = torch.gather(
-            intermediate, 1,
-            topk_ids.unsqueeze(-1).expand(-1, -1, rank),
-        )
+        # grouped_mm step 1: sorted_x @ lora_a^T
+        #   mat_a = sorted_x [M, H] (2D, sliced by offs)
+        #   mat_b = la^T = [E, H, r] (3D, one per expert group)
+        intermediate = torch.nn.functional.grouped_mm(
+            sorted_x, la.transpose(1, 2), offs=offs)  # [M, r]
 
-        # Step 3: project through lora_b per top-k slot and accumulate
-        lora_out = torch.zeros_like(x)  # [N, H]
-        for k in range(top_k):
-            inter_k = intermediate_selected[:, k]       # [N, r]
-            expert_ids_k = topk_ids[:, k]                # [N]
-            weight_k = topk_weights[:, k:k + 1]          # [N, 1]
+        # grouped_mm step 2: intermediate @ lora_b^T
+        #   mat_a = intermediate [M, r] (2D, sliced by offs)
+        #   mat_b = lb^T = [E, r, H] (3D, one per expert group)
+        sorted_out = torch.nn.functional.grouped_mm(
+            intermediate, lb.transpose(1, 2), offs=offs)  # [M, H]
 
-            # Gather lora_b for each token's expert
-            lora_b_k = lora_b[adapter_idx][expert_ids_k]  # [N, H, r]
+        # Unsort back to original token-expert order
+        lora_out = torch.empty_like(sorted_out)
+        lora_out[sort_indices] = sorted_out
 
-            # [N, 1, r] @ [N, r, H] -> [N, H]
-            out_k = torch.bmm(
-                inter_k.unsqueeze(1),
-                lora_b_k.transpose(1, 2),
-            ).squeeze(1)
-
-            lora_out += out_k * weight_k
-
-        output += (lora_out * mask).to(output.dtype)
+        # Apply routing weight and adapter mask, reshape and sum
+        lora_out = (lora_out * flat_weights * flat_mask).reshape(N, top_k, H)
+        output += lora_out.sum(dim=1).to(output.dtype)
 
 
 def _apply_perfte_lora_fake(
