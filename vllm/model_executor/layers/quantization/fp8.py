@@ -18,6 +18,7 @@ from vllm.model_executor.kernels.linear import (
 )
 from vllm.model_executor.kernels.linear.scaled_mm import MarlinFP8ScaledMMLinearKernel
 from vllm.model_executor.layers.attention import Attention
+from vllm.lora.layers import FusedMoEWithPERFTE
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     FusedMoEMethodBase,
@@ -897,7 +898,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: FusedMoE | FusedMoEWithPERFTE,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -905,6 +906,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+        if hasattr(layer, "punica_wrapper"):
+            # All lora layers should own the punica wrapper
+            lora_ids = layer.punica_wrapper.token_lora_indices
+            lora_a = layer.lora_a
+            lora_b = layer.lora_b
+
         return self.moe_kernel.apply(
             x,
             layer.w13_weight,
@@ -916,6 +923,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
+            lora_ids=lora_ids,
+            lora_a=lora_a,
+            lora_b=lora_b,
         )
 
 

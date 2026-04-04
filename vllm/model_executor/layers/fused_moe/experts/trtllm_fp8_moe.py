@@ -102,6 +102,10 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
     """
 
     @staticmethod
+    def supports_lora() -> bool:
+        return True
+
+    @staticmethod
     def _supports_quant_scheme(
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
@@ -151,6 +155,9 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        lora_ids: torch.Tensor | None = None,
+        lora_a: torch.Tensor | None = None,
+        lora_b: torch.Tensor | None = None,
     ):
         import flashinfer
         from flashinfer.fused_moe import Fp8QuantizationType
@@ -205,6 +212,26 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             # output=output,
         )
         output.copy_(result)
+        # TODO: Spawn lora computation on separate stream
+        if lora_ids is not None:
+            lora_ids = topk_ids + lora_ids * w1.shape[0]
+            print(lora_ids)
+            sorted_indices = torch.argsort(lora_ids)
+            hidden_states = hidden_states[sorted_indices]
+
+            flat_lora_a = lora_a.view(-1, lora_a.shape[-2], lora_a.shape[-1])
+            flat_lora_b = lora_b.view(-1, lora_b.shape[-2], lora_b.shape[-1])
+            
+            # We really want a bincount here but bincount is not cuda graph capturable
+            offs = torch.zeros(flat_lora_a.shape[0], device=lora_ids.device, dtype=torch.int32)
+            offs.scatter_add_(0, lora_ids + w1.shape[0], torch.ones_like(lora_ids, dtype=torch.int32))
+            offs = offs.cumsum(0, dtype=torch.int32)
+
+            intermediate = torch._grouped_mm(hidden_states.bfloat16(), flat_lora_a.transpose(-2, -1), offs=offs)
+            lora_output = torch._grouped_mm(intermediate, flat_lora_b.transpose(-2, -1), offs=offs)
+            print(flat_lora_a[:, 0, 0].shape)
+            print(lora_output)
+            output[sorted_indices] += lora_output
 
 
 class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):
