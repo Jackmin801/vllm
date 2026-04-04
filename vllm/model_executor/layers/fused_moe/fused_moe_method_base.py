@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 logger = init_logger(__name__)
 
 
+# Does weight loading
 class FusedMoEMethodBase(QuantizeMethodBase):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
