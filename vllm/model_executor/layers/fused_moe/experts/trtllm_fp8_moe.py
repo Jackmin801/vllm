@@ -213,25 +213,65 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         )
         output.copy_(result)
         # TODO: Spawn lora computation on separate stream
-        if lora_ids is not None:
-            lora_ids = topk_ids + lora_ids * w1.shape[0]
-            print(lora_ids)
-            sorted_indices = torch.argsort(lora_ids)
-            hidden_states = hidden_states[sorted_indices]
+        if lora_ids is not None and lora_a is not None and lora_b is not None:
+            num_experts = w1.shape[0]
+            topk = topk_ids.shape[1]
+            lora_ids = lora_ids + 1
 
+            # Dequantize FP8 hidden_states to bf16 using block scales
+            block_k = self.quant_config.block_shape[1]
+            hs_f32 = hidden_states.to(torch.float32).view(
+                hidden_states.shape[0], -1, block_k
+            )
+            scales = a1q_scale.unsqueeze(-1)  # (M, K//block_k, 1)
+            hs_bf16 = (hs_f32 * scales).view(hidden_states.shape).to(torch.bfloat16)
+
+            # Composite key: unique index per (lora, expert) pair
+            composite_ids = (lora_ids.unsqueeze(1) * num_experts + topk_ids).flatten()
+
+            # Sort by group
+            sorted_indices = torch.argsort(composite_ids)
+            sorted_composite = composite_ids[sorted_indices]
+
+            # Gather (replicate): each token appears topk times
+            token_idx = sorted_indices // topk
+            sorted_hs = hs_bf16[token_idx]
+
+            # Compute offs for _grouped_mm
             flat_lora_a = lora_a.view(-1, lora_a.shape[-2], lora_a.shape[-1])
             flat_lora_b = lora_b.view(-1, lora_b.shape[-2], lora_b.shape[-1])
-            
-            # We really want a bincount here but bincount is not cuda graph capturable
-            offs = torch.zeros(flat_lora_a.shape[0], device=lora_ids.device, dtype=torch.int32)
-            offs.scatter_add_(0, lora_ids + w1.shape[0], torch.ones_like(lora_ids, dtype=torch.int32))
-            offs = offs.cumsum(0, dtype=torch.int32)
+            num_groups = flat_lora_a.shape[0]
 
-            intermediate = torch._grouped_mm(hidden_states.bfloat16(), flat_lora_a.transpose(-2, -1), offs=offs)
-            lora_output = torch._grouped_mm(intermediate, flat_lora_b.transpose(-2, -1), offs=offs)
-            print(flat_lora_a[:, 0, 0].shape)
-            print(lora_output)
-            output[sorted_indices] += lora_output
+            counts = torch.zeros(num_groups, device=output.device, dtype=torch.int32)
+            counts.scatter_add_(
+                0,
+                sorted_composite.int(),
+                torch.ones_like(sorted_composite, dtype=torch.int32),
+            )
+            offs = counts.cumsum(0, dtype=torch.int32)
+
+            # grouped_mm: shrink then expand
+            intermediate = torch._grouped_mm(
+                sorted_hs,
+                flat_lora_a.transpose(-2, -1),
+                offs=offs,
+            )
+            lora_out = torch._grouped_mm(
+                intermediate,
+                flat_lora_b.transpose(-2, -1),
+                offs=offs,
+            )
+
+            # Scatter-add weighted results back into output [M, K]
+            topk_slot = sorted_indices % topk
+            weights = (
+                topk_weights[token_idx, topk_slot].unsqueeze(-1).to(lora_out.dtype)
+            )
+            output.scatter_add_(
+                0,
+                token_idx.unsqueeze(-1).expand_as(lora_out),
+                lora_out * weights,
+            )
 
 
 class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):

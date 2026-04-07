@@ -8,8 +8,7 @@ from transformers import PretrainedConfig
 from vllm import envs
 from vllm.config.lora import LoRAConfig
 from vllm.lora.layers.base import BaseLayerWithLoRA
-from vllm.model_executor.layers.fused_moe import FusedMoE, SharedFusedMoE
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.model_executor.layers.fused_moe import FusedMoE
 
 from .utils import _get_lora_device
 
@@ -19,7 +18,9 @@ class FusedMoEWithPERFTE(BaseLayerWithLoRA):
         super().__init__()
         self.base_layer = base_layer
 
-        assert self.base_layer.tp_size == 1, "FusedMoEWithPERFTE does not support tensor parallelism"
+        assert self.base_layer.tp_size == 1, (
+            "FusedMoEWithPERFTE does not support tensor parallelism"
+        )
         self.device = _get_lora_device(base_layer)
 
     def _create_lora_a_weights(self, max_loras: int, lora_config: LoRAConfig):
@@ -79,8 +80,9 @@ class FusedMoEWithPERFTE(BaseLayerWithLoRA):
         lora_b: torch.Tensor,
     ):
         """Overwrites lora tensors at index."""
-        assert len(lora_a.shape) == len(lora_b.shape) == 3, \
+        assert len(lora_a.shape) == len(lora_b.shape) == 3, (
             "Lora should have shape (local_num_experts, r/H, H/r)"
+        )
         index += 1
         self.adapter_enabled[index] = True
         # Pad rank dimension if adapter rank < max_lora_rank
@@ -97,6 +99,9 @@ class FusedMoEWithPERFTE(BaseLayerWithLoRA):
         self.base_layer.punica_wrapper = punica_wrapper
         self.base_layer.lora_a = self.lora_a
         self.base_layer.lora_b = self.lora_b
+        self.base_layer.quant_method.moe_kernel.impl.prepare_finalize.set_max_loras(
+            self.max_loras
+        )
 
     @classmethod
     def can_replace_layer(
@@ -108,13 +113,11 @@ class FusedMoEWithPERFTE(BaseLayerWithLoRA):
     ) -> bool:
         """Returns True if the layer can be replaced by this LoRA layer."""
 
-        # source_layer is FusedMoE or SharedFusedMoE
-        is_moe = isinstance(source_layer, FusedMoE) or isinstance(source_layer, SharedFusedMoE)
-        return is_moe and envs.VLLM_MOE_LORA_USE_PERFTE
+        return isinstance(source_layer, FusedMoE) and envs.VLLM_MOE_LORA_USE_PERFTE
 
-    #===============================================
+    # ===============================================
     # Passthrough methods
-    #===============================================
+    # ===============================================
     def maybe_all_reduce_tensor_model_parallel(self, *args, **kwargs):
         return self.base_layer.maybe_all_reduce_tensor_model_parallel(*args, **kwargs)
 
@@ -130,8 +133,8 @@ class FusedMoEWithPERFTE(BaseLayerWithLoRA):
     def is_internal_router(self) -> bool:
         return self.base_layer.is_internal_router
 
-    #===============================================
+    # ===============================================
     # Forward with parallel LoRA path
-    #===============================================
+    # ===============================================
     def forward(self, *args, **kwargs):
         return self.base_layer.forward(*args, **kwargs)
