@@ -60,6 +60,10 @@ class FlashInferNVLinkTwoSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             )
             a1.mul_(topk_weights.to(a1.dtype))
 
+    def set_max_loras(self, max_loras: int):
+        # +1 for the -1
+        self.lora_lanes = max_loras + 1
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -70,12 +74,19 @@ class FlashInferNVLinkTwoSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
+        lora_ids: torch.Tensor | None = None,
     ) -> mk.PrepareResultType:
         self._apply_router_weight_on_input(
             a1, topk_weights, topk_ids, apply_router_weight_on_input
         )
         global_num_tokens_cpu = get_local_sizes()
         top_k = topk_ids.size(1)
+
+        if lora_ids is not None:
+            topk_ids = (topk_ids * self.lora_lanes + lora_ids.unsqueeze(1) + 1).to(
+                topk_ids.dtype
+            )
+            num_experts = num_experts * self.lora_lanes
 
         (self.alltoall_info, topk_ids, topk_weights, a1q, a1q_scale) = (
             flashinfer_alltoall_dispatch(
@@ -92,7 +103,12 @@ class FlashInferNVLinkTwoSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             )
         )
 
-        return a1q, a1q_scale, None, topk_ids, topk_weights
+        if lora_ids is not None:
+            lora_ids = (topk_ids % self.lora_lanes) - 1
+            lora_ids = lora_ids.amax(dim=1)
+            topk_ids = topk_ids // self.lora_lanes
+
+        return a1q, a1q_scale, None, topk_ids, topk_weights, lora_ids
 
     def finalize(
         self,

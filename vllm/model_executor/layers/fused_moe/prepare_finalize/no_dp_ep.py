@@ -63,6 +63,7 @@ class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
+        lora_ids: torch.Tensor | None = None,
     ) -> mk.PrepareResultType:
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
@@ -75,7 +76,7 @@ class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
 
         a1q, a1q_scale = _quantize_input(a1, quant_config, defer_input_quant)
 
-        return a1q, a1q_scale, None, None, None
+        return a1q, a1q_scale, None, None, None, lora_ids
 
     def finalize(
         self,

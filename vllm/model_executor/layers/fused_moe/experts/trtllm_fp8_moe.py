@@ -83,10 +83,11 @@ class TrtLlmFp8ExpertsBase:
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
         """Monolithic kernel so only use with naive DP/EP and TP."""
-        return (
-            not moe_parallel_config.use_all2all_kernels
-            or moe_parallel_config.use_ag_rs_all2all_kernels
-        ) and not moe_parallel_config.enable_eplb
+        return True
+        # return (
+        #     not moe_parallel_config.use_all2all_kernels
+        #     or moe_parallel_config.use_ag_rs_all2all_kernels
+        # ) and not moe_parallel_config.enable_eplb
 
     def supports_chunking(self) -> bool:
         return False
@@ -99,6 +100,10 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
     """
     Fp8 TRTLLM-Gen MoE kernels. Supports modular interface.
     """
+
+    @staticmethod
+    def supports_lora() -> bool:
+        return True
 
     @staticmethod
     def _supports_quant_scheme(
@@ -150,6 +155,9 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        lora_ids: torch.Tensor | None = None,
+        lora_a: torch.Tensor | None = None,
+        lora_b: torch.Tensor | None = None,
     ):
         import flashinfer
         from flashinfer.fused_moe import Fp8QuantizationType
@@ -204,6 +212,66 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             # output=output,
         )
         output.copy_(result)
+        # TODO: Spawn lora computation on separate stream
+        if lora_ids is not None and lora_a is not None and lora_b is not None:
+            num_experts = lora_a.shape[1]
+            topk = topk_ids.shape[1]
+            lora_ids = lora_ids + 1
+
+            # Dequantize FP8 hidden_states to bf16 using block scales
+            block_k = self.quant_config.block_shape[1]
+            hs_f32 = hidden_states.to(torch.float32).view(
+                hidden_states.shape[0], -1, block_k
+            )
+            scales = a1q_scale.unsqueeze(-1)  # (M, K//block_k, 1)
+            hs_bf16 = (hs_f32 * scales).view(hidden_states.shape).to(torch.bfloat16)
+
+            # Composite key: unique index per (lora, expert) pair
+            composite_ids = (lora_ids.unsqueeze(1) * num_experts + topk_ids).flatten()
+
+            # Sort by group
+            sorted_indices = torch.argsort(composite_ids)
+            sorted_composite = composite_ids[sorted_indices]
+
+            # Gather (replicate): each token appears topk times
+            token_idx = sorted_indices // topk
+            sorted_hs = hs_bf16[token_idx]
+
+            # Compute offs for _grouped_mm
+            flat_lora_a = lora_a.view(-1, lora_a.shape[-2], lora_a.shape[-1])
+            flat_lora_b = lora_b.view(-1, lora_b.shape[-2], lora_b.shape[-1])
+            num_groups = flat_lora_a.shape[0]
+
+            counts = torch.zeros(num_groups, device=output.device, dtype=torch.int32)
+            counts.scatter_add_(
+                0,
+                sorted_composite.int(),
+                torch.ones_like(sorted_composite, dtype=torch.int32),
+            )
+            offs = counts.cumsum(0, dtype=torch.int32)
+
+            # grouped_mm: shrink then expand
+            intermediate = torch._grouped_mm(
+                sorted_hs,
+                flat_lora_a.transpose(-2, -1),
+                offs=offs,
+            )
+            lora_out = torch._grouped_mm(
+                intermediate,
+                flat_lora_b.transpose(-2, -1),
+                offs=offs,
+            )
+
+            # Scatter-add weighted results back into output [M, K]
+            topk_slot = sorted_indices % topk
+            weights = (
+                topk_weights[token_idx, topk_slot].unsqueeze(-1).to(lora_out.dtype)
+            )
+            output.scatter_add_(
+                0,
+                token_idx.unsqueeze(-1).expand_as(lora_out),
+                lora_out * weights,
+            )
 
 
 class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):

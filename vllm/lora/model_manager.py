@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.lora.layers import (
     BaseLayerWithLoRA,
     FusedMoE3DWithLoRA,
+    FusedMoEWithPERFTE,
     LoRAMapping,
     LoRAMappingType,
 )
@@ -446,7 +447,10 @@ class LoRAModelManager:
                 continue
             self.register_module(module_name, new_module)
 
-            self._register_packed_modules(module_name)
+            # PERFT-E weights are already 3D tensors (num_experts, rank, H),
+            # not split per w1/w2/w3, so skip packed module registration.
+            if not isinstance(new_module, FusedMoEWithPERFTE):
+                self._register_packed_modules(module_name)
             # All lora layers share the same punica_wrapper based on reference.
             new_module.set_mapping(punica_wrapper)
 
@@ -516,6 +520,23 @@ class LoRAModelManager:
                         rank,
                         module.lora_a_stacked[0].dtype,
                         "cpu",
+                    )
+                    model.loras[module_name] = lora
+                elif isinstance(module, FusedMoEWithPERFTE):
+                    # PERFT-E stores lora_a/lora_b as 3D tensors
+                    # (num_experts, rank, hidden) directly.
+                    num_experts = module.base_layer.local_num_experts
+                    hidden_size = module.base_layer.hidden_size
+                    lora = LoRALayerWeights(
+                        module_name,
+                        rank=rank,
+                        lora_alpha=1,
+                        lora_a=torch.zeros(
+                            num_experts, rank, hidden_size,
+                            dtype=module.lora_a.dtype, device="cpu"),
+                        lora_b=torch.zeros(
+                            num_experts, hidden_size, rank,
+                            dtype=module.lora_b.dtype, device="cpu"),
                     )
                     model.loras[module_name] = lora
                 elif module.__class__.__name__ == "FusedMoE3DWithLoRA":

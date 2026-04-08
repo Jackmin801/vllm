@@ -21,6 +21,7 @@ from vllm.lora.layers import (
     ColumnParallelLinearWithShardedLoRA,
     FusedMoE3DWithLoRA,
     FusedMoEWithLoRA,
+    FusedMoEWithPERFTE,
     LogitsProcessorWithLoRA,
     MergedColumnParallelLinearVariableSliceWithLoRA,
     MergedColumnParallelLinearWithLoRA,
@@ -88,6 +89,7 @@ _all_lora_classes: set[type[BaseLayerWithLoRA]] = {
     MergedColumnParallelLinearVariableSliceWithLoRA,
     MergedQKVParallelLinearWithShardedLoRA,
     RowParallelLinearWithShardedLoRA,
+    FusedMoEWithPERFTE, # Must be before others
     FusedMoEWithLoRA,
     FusedMoE3DWithLoRA,
 }
