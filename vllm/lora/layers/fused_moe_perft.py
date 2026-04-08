@@ -27,7 +27,7 @@ class FusedMoEWithPERFTE(BaseLayerWithLoRA):
         self.lora_a = torch.zeros(
             (
                 max_loras + 1,
-                self.base_layer.local_num_experts,
+                self.base_layer.local_num_experts + 1,
                 lora_config.max_lora_rank,
                 self.base_layer.hidden_size,
             ),
@@ -39,7 +39,7 @@ class FusedMoEWithPERFTE(BaseLayerWithLoRA):
         self.lora_b = torch.zeros(
             (
                 max_loras + 1,
-                self.base_layer.local_num_experts,
+                self.base_layer.local_num_experts + 1,
                 self.base_layer.hidden_size,
                 lora_config.max_lora_rank,
             ),
@@ -89,8 +89,8 @@ class FusedMoEWithPERFTE(BaseLayerWithLoRA):
         rank_a = lora_a.shape[1]
         self.lora_a[index] = 0
         self.lora_b[index] = 0
-        self.lora_a[index, :, :rank_a, :] = lora_a
-        self.lora_b[index, :, :, :rank_a] = lora_b
+        self.lora_a[index, : self.base_layer.local_num_experts, :rank_a, :] = lora_a
+        self.lora_b[index, : self.base_layer.local_num_experts, :, :rank_a] = lora_b
 
     def set_mapping(self, punica_wrapper):
         self.punica_wrapper = punica_wrapper

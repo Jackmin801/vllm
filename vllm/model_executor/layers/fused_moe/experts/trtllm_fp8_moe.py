@@ -214,7 +214,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         output.copy_(result)
         # TODO: Spawn lora computation on separate stream
         if lora_ids is not None and lora_a is not None and lora_b is not None:
-            num_experts = w1.shape[0]
+            num_experts = lora_a.shape[1]
             topk = topk_ids.shape[1]
             lora_ids = lora_ids + 1
 

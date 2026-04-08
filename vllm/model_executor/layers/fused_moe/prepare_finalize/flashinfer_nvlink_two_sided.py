@@ -83,7 +83,9 @@ class FlashInferNVLinkTwoSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         top_k = topk_ids.size(1)
 
         if lora_ids is not None:
-            topk_ids = topk_ids * self.lora_lanes + lora_ids.unsqueeze(1) + 1
+            topk_ids = (topk_ids * self.lora_lanes + lora_ids.unsqueeze(1) + 1).to(
+                topk_ids.dtype
+            )
             num_experts = num_experts * self.lora_lanes
 
         (self.alltoall_info, topk_ids, topk_weights, a1q, a1q_scale) = (
